@@ -8,23 +8,7 @@
 </p>
 <p align="center"><a href="#установка">Установка</a> · <a href="#вход">Вход</a> · <a href="#управление">Управление</a> · <a href="#приватность">Приватность</a></p>
 
-Локальная очередь конкретных занятий и прямые запросы к My ITMO. Телефон и ITMO.Widgets не нужны.
-
-> **Важно.** kronbot использует неофициально описанный API My ITMO. Разрешение ИТМО на автоматизацию не подтверждено. Проверьте действующие правила и используйте программу только если это разрешено. При сомнениях записывайтесь вручную через My ITMO.
-
-Пример экрана с синтетическими данными:
-
-```text
-ИТМО: вход выполнен | access: 05.10 14:30 | refresh: 04.11 14:00
-Автозапись: на паузе | Последняя проверка: 05.10 14:00
-
- Расписание   Очередь
- ID       МСК          Секция              Зал        Места  Доступность
- 500001   06.10 10:00  Тестовая секция     Спортзал   0      Да
- 500002   07.10 18:00  Вторая секция       Зал 2      2      Да
-
- p Авто   r Обновить   x Удалить   l Вход   u Забыть вход   q Выход
-```
+> **Дисклеймер.** kronbot использует неофициально описанный API. Официально никто не разрешал ботов/скрипты такого плана (но соответственно никто и не запрещал), так что использование - на свой страх и риск. При сомнениях записывайтесь вручную через my.itmo.
 
 ## Что делает
 
@@ -41,27 +25,24 @@
 
 ## Установка
 
-Нужны Python 3.12.4+ и [uv](https://docs.astral.sh/uv/getting-started/installation/). Целевые системы: macOS 14+, Windows 11, Ubuntu 24.04 и Debian 12; для графического входа требуется поддерживаемое Playwright окружение. Команды одинаковы для POSIX shell и PowerShell, запускать из каталога проекта:
+Нужны Python 3.12.4+ и [uv](https://docs.astral.sh/uv/getting-started/installation/). Целевые системы: macOS 14+, Windows 11, Ubuntu 24.04 и Debian 12; для графического входа требуется поддерживаемое Playwright окружение. Установите программу из каталога проекта:
 
 ```sh
-uv sync --locked --no-dev
-uv run --locked --no-dev kronbot --help
+uv tool install '.[tui]'
 ```
 
-Терминальный интерфейс:
+После этого `kronbot` доступен из любого каталога: `kronbot` или `kronbot tui` открывает терминальный интерфейс, `kronbot --help` показывает CLI-команды. Если команда не найдена, выполните `uv tool update-shell` и откройте новый терминал.
+
+Для веб-входа переустановите инструмент с поддержкой браузера и установите Chromium:
 
 ```sh
-uv run --locked --no-dev --extra tui kronbot tui
+uv tool install --force '.[tui,browser]'
+uv tool run --from '.[browser]' playwright install chromium
 ```
 
-Только для веб-входа установите Chromium:
+Обе команды запускаются из каталога проекта. На поддерживаемом Linux при недостающих библиотеках используйте `uv tool run --from '.[browser]' playwright install --with-deps chromium` по [инструкции Playwright](https://playwright.dev/python/docs/intro). Для входа с паролем или токеном Playwright, Chromium и графический интерфейс не нужны.
 
-```sh
-uv run --locked --no-dev --extra browser playwright install chromium
-uv run --locked --no-dev --extra browser kronbot --accept-risk login browser
-```
-
-Веб-вход из TUI: `uv run --locked --no-dev --extra tui --extra browser kronbot tui`. На поддерживаемом Linux при недостающих библиотеках используйте `uv run --locked --no-dev --extra browser playwright install --with-deps chromium` по [инструкции Playwright](https://playwright.dev/python/docs/intro). Для входа с паролем или токеном Playwright, Chromium и графический интерфейс не нужны.
+После обновления исходников переустановите инструмент той же командой `uv tool install --force` с выбранными extras. Удаление: `uv tool uninstall kronbot`.
 
 ## Вход
 
@@ -70,11 +51,11 @@ uv run --locked --no-dev --extra browser kronbot --accept-risk login browser
 В TUI выберите «Веб-вход», «Логин и пароль», «Refresh-токен My ITMO» или «Access-токен My ITMO». В CLI:
 
 ```sh
-uv run --locked --no-dev --extra browser kronbot --accept-risk login browser
-uv run --locked --no-dev kronbot --accept-risk login password
-uv run --locked --no-dev kronbot --accept-risk login refresh-token
-uv run --locked --no-dev kronbot --accept-risk login access-token
-uv run --locked --no-dev kronbot logout
+kronbot login browser
+kronbot login password
+kronbot login refresh-token
+kronbot login access-token
+kronbot logout
 ```
 
 Пароль и токен вводятся скрыто в терминале, не через аргументы или переменные окружения. Вставляйте только свой токен. Access-токен не продлевается автоматически. При успешном обмене refresh-токен ротируется: старый становится недействительным, поэтому не делите его с другим клиентом. При прерывании обмена старый токен может уже не работать. `logout` забывает локальную сессию, но не завершает серверную.
@@ -93,23 +74,23 @@ uv run --locked --no-dev kronbot logout
 
 CLI, синтетические ID:
 
-| Команда после `uv run --locked --no-dev kronbot` | Действие |
+| Команда | Действие |
 |---|---|
-| `--accept-risk schedule` | Свежее расписание |
-| `--accept-risk queue add 500002` | Добавить в очередь без записи |
-| `queue list` | Локальная очередь |
-| `queue remove 500002` | Удалить локально |
-| `queue retry 500002 --verified-not-booked` | Разрешить повтор после самостоятельной проверки My ITMO |
-| `--accept-risk book 500001` | Одна попытка для указанного ID |
-| `--accept-risk watch` | Ожидать места в переднем плане; остановка Ctrl+C |
+| `kronbot schedule` | Свежее расписание |
+| `kronbot queue add 500002` | Добавить в очередь без записи |
+| `kronbot queue list` | Локальная очередь |
+| `kronbot queue remove 500002` | Удалить локально |
+| `kronbot queue retry 500002 --verified-not-booked` | Разрешить повтор после самостоятельной проверки My ITMO |
+| `kronbot book 500001` | Одна попытка для указанного ID |
+| `kronbot watch` | Ожидать места в переднем плане; остановка Ctrl+C |
 
 Для удаления `uncertain` также обязателен `--verified-not-booked`. Сначала проверьте запись непосредственно в My ITMO: отсутствие в календаре программы не доказывает, что запрос не прошёл.
 
-Коды выхода: `0` — выполнено, `1` — локальная или временная ошибка, `2` — неверные аргументы, отсутствие терминала или согласия, `3` — нужен вход либо действует сетевое ограничение, `4` — запись не подтверждена или операция неприменима. `watch` возвращает `4`, если остались только неопределённые исходы.
+Коды выхода: `0` — выполнено, `1` — локальная или временная ошибка, `2` — неверные аргументы или отсутствие терминала, `3` — нужен вход либо действует сетевое ограничение, `4` — запись не подтверждена или операция неприменима. `watch` возвращает `4`, если остались только неопределённые исходы.
 
-## Ограничения и правила ИТМО
+## Технические ограничения
 
-Программа ограничивает спортивные запросы 60 в скользящий час, запись — одной попыткой в 120 секунд; эти технические пределы не означают разрешение ИТМО. Ответы `403`, `429` и неожиданный HTML останавливают автоматику; не меняйте аккаунт, IP или настройки для обхода ограничений. Сверяйте условия с [правилами физкультуры ИТМО](https://student.itmo.ru/ru/education/modules/bachelor/physical_education), информацией [Кронверкских барсов](https://kronbars.itmo.ru/students) и при необходимости обращайтесь в [поддержку ИТМО](https://helpdesk.itmo.ru/servicedesk/customer/portal/2). Эти источники не подтверждают разрешение на автоматизацию.
+Программа ограничивает спортивные запросы 60 в скользящий час, запись — одной попыткой в 120 секунд, но эти пределы не означают разрешение от ИТМО. Технически никто не запрещает автоматизировать это через API, но вы используете приложение на свой страх и риск. 
 
 ## Приватность
 
@@ -130,4 +111,4 @@ uv run --locked --extra browser pytest -q tests/test_browser.py
 
 ## Лицензия
 
-[MIT](LICENSE), Copyright (c) 2026 kronbot contributors.
+[MIT](LICENSE), Copyright (c) 2026 citr0n.
