@@ -15,27 +15,11 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sel
 from .agent import Agent, MSK, QueueError
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
-from .notice import RISK_NOTICE
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError
 from .state import StateError, StateLocked, StateStore
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
 
-
-class RiskScreen(ModalScreen[bool]):
-    BINDINGS = [("escape", "reject", "Выйти")]
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
-            yield Static(RISK_NOTICE, markup=False)
-            with Horizontal():
-                yield Button("Продолжить", id="continue", variant="primary")
-                yield Button("Выйти", id="exit")
-    def on_mount(self):
-        self.query_one("#exit", Button).focus()
-    def on_button_pressed(self, event: Button.Pressed):
-        self.dismiss(event.button.id == "continue")
-    def action_reject(self):
-        self.dismiss(False)
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -166,7 +150,6 @@ class KronbotApp(App):
         self.agent = Agent(store, self.sport, now=now, monotonic=monotonic)
         self.now, self.monotonic = now, monotonic
         self.auto = False
-        self.accepted = False
         self.busy = None
         self.last_auto = None
         self.limit_until = 0
@@ -190,13 +173,6 @@ class KronbotApp(App):
         self.query_one("#queue", DataTable).add_columns("ID", "МСК", "Секция", "Статус")
         self._render()
         self.set_interval(0.5, self._tick)
-        self.push_screen(RiskScreen(), self._risk_result)
-
-    def _risk_result(self, accepted):
-        if not accepted:
-            asyncio.create_task(self.action_quit_safe())
-            return
-        self.accepted = True
         if self.store.data["session"] is None:
             self.action_login()
         else:
@@ -252,7 +228,7 @@ class KronbotApp(App):
                 pass
 
     def _start(self, auto=False):
-        if not self.accepted or self.busy and not self.busy.done() or self.stopping:
+        if self.busy and not self.busy.done() or self.stopping:
             return
         self.busy = asyncio.create_task(self._check(auto))
     async def _check(self, auto):

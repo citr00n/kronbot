@@ -2,14 +2,14 @@ from datetime import datetime, timezone
 
 import httpx
 import pytest
-from textual.widgets import Button, DataTable
+from textual.widgets import DataTable
 
 from kronbot.state import StateStore
 from kronbot.sport import SportClient
-from kronbot.tui import KronbotApp, RiskScreen
+from kronbot.tui import KronbotApp
 
 
-async def test_risk_gate_and_read_only_refresh(tmp_path):
+async def test_startup_read_only_refresh(tmp_path):
     now = 1900000000
     calls = []
     start = datetime.fromtimestamp(now + 86400, timezone.utc).isoformat()
@@ -22,10 +22,6 @@ async def test_risk_gate_and_read_only_refresh(tmp_path):
         client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
         app = KronbotApp(store, sport=client, now=lambda: now)
         async with app.run_test(size=(80, 24)) as pilot:
-            assert isinstance(app.screen, RiskScreen)
-            assert not calls
-            assert app.screen.focused.id == "exit"
-            await pilot.click("#continue")
             await pilot.pause()
             assert len(calls) == 1 and calls[0].method == "GET"
             assert app.query_one("#schedule", DataTable).row_count == 1
@@ -52,7 +48,6 @@ async def test_queue_and_auto_booking(tmp_path):
         client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: clock["wall"])
         app = KronbotApp(store, sport=client, now=lambda: clock["wall"], monotonic=lambda: clock["mono"])
         async with app.run_test(size=(80, 24)) as pilot:
-            await pilot.click("#continue")
             await pilot.pause()
             app.query_one("#schedule", DataTable).focus()
             await pilot.press("enter")
@@ -76,7 +71,6 @@ async def test_login_password_is_masked_and_escape_returns(tmp_path):
     with StateStore(tmp_path / "state") as store:
         app = KronbotApp(store)
         async with app.run_test(size=(80, 24)) as pilot:
-            await pilot.click("#continue")
             await pilot.pause()
             assert isinstance(app.screen, LoginScreen)
             app.screen.query_one("#method", Select).value = "password"

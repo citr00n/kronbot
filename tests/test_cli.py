@@ -16,14 +16,14 @@ def invoke(*args, input=None, env=None):
     return subprocess.run([sys.executable, "-m", "kronbot", *args], input=input, text=True, capture_output=True, env=env)
 
 
-def test_help_and_risk_gate_without_tty(tmp_path):
-    env = {**os.environ, "KRONBOT_STATE_DIR": str(tmp_path / "not-created")}
+def test_help_and_commands_without_tty(tmp_path):
+    env = {**os.environ, "KRONBOT_STATE_DIR": str(tmp_path / "state")}
     help_result = invoke("--help", env=env)
     assert help_result.returncode == 0 and "schedule" in help_result.stdout
-    denied = invoke("book", "500001", env=env)
-    assert denied.returncode == 2 and "неофициально" in denied.stderr
-    assert not (tmp_path / "not-created").exists()
-    password = invoke("--accept-risk", "login", "password", input="user\nsecret\n", env=env)
+    assert not (tmp_path / "state").exists()
+    booking = invoke("book", "500001", env=env)
+    assert booking.returncode == 3 and "Нужен новый вход" in booking.stderr
+    password = invoke("login", "password", input="user\nsecret\n", env=env)
     assert password.returncode == 2 and "терминал" in password.stderr
     assert "secret" not in password.stdout + password.stderr
 
@@ -47,7 +47,7 @@ async def test_queue_and_single_booking(tmp_path, capsys):
         store.save()
         client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
         async def run(*argv):
-            return await execute(parser().parse_args(["--accept-risk", *argv]), store, client, now=lambda: now)
+            return await execute(parser().parse_args(list(argv)), store, client, now=lambda: now)
         assert await run("schedule") == 0
         assert "500001" in capsys.readouterr().out
         assert await run("queue", "add", "500002") == 0
@@ -89,7 +89,7 @@ async def test_watch_stop_never_cancels_started_post(tmp_path, stop_at_post):
         store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Секция", "starts_at": stamp, "status": "waiting", "refusal_code": None}]
         store.save()
         client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
-        task = asyncio.create_task(execute(parser().parse_args(["--accept-risk", "watch"]), store, client, cancel=cancel, now=lambda: now))
+        task = asyncio.create_task(execute(parser().parse_args(["watch"]), store, client, cancel=cancel, now=lambda: now))
         await reached.wait()
         cancel.set()
         client.stopped = True
@@ -116,7 +116,7 @@ async def test_book_reports_uncertain_post(tmp_path, capsys):
         store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
         store.save()
         client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
-        result = await execute(parser().parse_args(["--accept-risk", "book", "1"]), store, client, now=lambda: now)
+        result = await execute(parser().parse_args(["book", "1"]), store, client, now=lambda: now)
         assert result == 4
         output = capsys.readouterr().out
         assert "Проверьте в My ITMO" in output and "private response" not in output

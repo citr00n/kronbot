@@ -13,7 +13,6 @@ from datetime import datetime
 from .agent import Agent, MSK, QueueError
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
-from .notice import RISK_NOTICE
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
 from .state import StateError, StateLocked, StateStore
 
@@ -31,8 +30,7 @@ def positive_id(value):
 
 
 def parser():
-    result = argparse.ArgumentParser(prog="kronbot", description="Неофициальный API My ITMO: проверьте правила использования.")
-    result.add_argument("--accept-risk", action="store_true", help="Подтвердить риск использования неофициального API")
+    result = argparse.ArgumentParser(prog="kronbot", description="Автозапись на физкультуру ИТМО.")
     sub = result.add_subparsers(dest="command")
     sub.add_parser("tui", help="Открыть терминальный интерфейс")
     login = sub.add_parser("login", help="Войти в ITMO.ID")
@@ -262,13 +260,9 @@ def main() -> int:
         try:
             from .tui import run
         except ImportError:
-            print("Установите TUI: uv run --locked --extra tui kronbot", file=sys.stderr)
+            print("Установите TUI из каталога проекта: uv tool install --force '.[tui]'", file=sys.stderr)
             return 2
         return run()
-    needs_risk = args.command in ("login", "schedule", "book", "watch") or args.command == "queue" and args.queue_command == "add"
-    if needs_risk and not args.accept_risk:
-        print(RISK_NOTICE, file=sys.stderr)
-        return 2
     try:
         with StateStore() as store:
             return asyncio.run(_run(args, store))
