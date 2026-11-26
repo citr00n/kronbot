@@ -31,7 +31,7 @@ def state_directory() -> Path:
 
 def empty_state():
     return {"version": 1, "session": None, "queues": {}, "sport_request_times": [],
-            "last_enroll_at": None, "blocked_until": {}}
+            "last_enroll_at": None, "blocked_until": {}, "background_paused": False}
 
 
 def _integer(value):
@@ -40,6 +40,8 @@ def _integer(value):
 
 def _validate_state(data):
     if not isinstance(data, dict) or set(data) != set(empty_state()) or data["version"] != 1 or type(data["version"]) is not int:
+        raise ValueError()
+    if type(data["background_paused"]) is not bool:
         raise ValueError()
     session = data["session"]
     if session is not None:
@@ -133,6 +135,8 @@ class StateStore:
                     blob = base64.b64decode(outer["dpapi"], validate=True)
                     _, raw = win32crypt.CryptUnprotectData(blob, None, None, None, 1)
                     outer = json.loads(raw)
+                if isinstance(outer, dict) and "background_paused" not in outer:
+                    outer["background_paused"] = False
                 _validate_state(outer)
                 self.data = outer
             return self

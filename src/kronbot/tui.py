@@ -41,6 +41,30 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+LOGIN_GUIDE = {
+    "browser": (
+        "1. Выйдите из TUI и выполните: kronbot browser install\n"
+        "2. Нужны графическая сессия и работающий sandbox.\n"
+        "3. Вернитесь в TUI, нажмите «Войти» и войдите в отдельном Chromium."
+    ),
+    "password": (
+        "1. Введите логин ИТМО и пароль ниже.\n"
+        "2. Пароль скрыт при вводе; нажмите Enter или «Войти».\n"
+        "3. Если нужен дополнительный шаг, используйте веб-вход."
+    ),
+    "refresh": (
+        "1. Вставьте только свой refresh-токен My ITMO в скрытое поле.\n"
+        "2. Нажмите Enter или «Войти»: токен будет обменян и ротирован.\n"
+        "Исходная сессия может перестать работать; не делите токен."
+    ),
+    "access": (
+        "1. Вставьте только свой access-токен My ITMO в скрытое поле.\n"
+        "2. Нажмите Enter или «Войти».\n"
+        "Access-токен не продлевается автоматически; затем нужен новый вход."
+    ),
+}
+
+
 class LoginScreen(ModalScreen):
     BINDINGS = [("escape", "back", "Назад")]
     def __init__(self):
@@ -48,12 +72,12 @@ class LoginScreen(ModalScreen):
         self.cancel = asyncio.Event()
         self.login_task = None
     def compose(self):
-        with Vertical(classes="dialog"):
+        with Vertical(classes="dialog login-dialog"):
             yield Label("Вход в ИТМО")
             yield Select([("Веб-вход", "browser"), ("Логин и пароль", "password"), ("Refresh-токен My ITMO", "refresh"), ("Access-токен My ITMO", "access")], value="browser", allow_blank=False, id="method")
+            yield Static("", id="login-guide", markup=False)
             yield Input(placeholder="Логин", id="username")
             yield Input(placeholder="Пароль или токен", password=True, id="secret")
-            yield Static("Refresh-токен после обмена нельзя использовать в другом клиенте.", markup=False)
             yield Static("", id="login-error", markup=False)
             with Horizontal():
                 yield Button("Войти", id="submit", variant="primary")
@@ -66,6 +90,7 @@ class LoginScreen(ModalScreen):
         method = self.query_one("#method", Select).value
         self.query_one("#username", Input).display = method == "password"
         self.query_one("#secret", Input).display = method != "browser"
+        self.query_one("#login-guide", Static).update(LOGIN_GUIDE[method])
     def on_input_submitted(self, event):
         self._start()
     def on_button_pressed(self, event):
@@ -131,6 +156,8 @@ class KronbotApp(App):
     CSS = """
     Screen { layout: vertical; }
     .dialog { width: 75%; max-width: 80; height: auto; max-height: 95%; padding: 1 2; border: solid $accent; background: $surface; align: center middle; }
+    .login-dialog { padding: 0 1; }
+    #login-guide { height: auto; }
     ModalScreen { align: center middle; }
     .dialog Horizontal { height: auto; align: center middle; }
     .dialog Button { margin: 0 1; }

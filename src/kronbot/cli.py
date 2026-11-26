@@ -3,18 +3,22 @@
 import argparse
 import asyncio
 import getpass
+import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import warnings
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 
 from .agent import Agent, MSK, QueueError
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
-from .state import StateError, StateLocked, StateStore
+from .state import StateError, StateLocked, StateStore, state_directory
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
 
@@ -34,7 +38,8 @@ def parser():
     sub = result.add_subparsers(dest="command")
     sub.add_parser("tui", help="Открыть терминальный интерфейс")
     login = sub.add_parser("login", help="Войти в ITMO.ID")
-    login.add_argument("method", choices=("browser", "password", "access-token", "refresh-token"))
+    login.add_argument("method", nargs="?", choices=("browser", "password", "access-token", "refresh-token"),
+                       help="Без аргумента откроется пошаговый выбор")
     sub.add_parser("logout", help="Локально забыть вход")
     sub.add_parser("schedule", help="Показать расписание на семь дней")
     queue = sub.add_parser("queue", help="Управлять локальной очередью")
@@ -48,6 +53,18 @@ def parser():
     book = sub.add_parser("book", help="Попробовать записаться один раз")
     book.add_argument("id", type=positive_id, metavar="ID")
     sub.add_parser("watch", help="Ожидать места в переднем плане")
+    browser = sub.add_parser("browser", help="Установить Chromium для веб-входа")
+    browser_commands = browser.add_subparsers(dest="browser_command", required=True)
+    install_browser = browser_commands.add_parser("install", help="Установить Chromium")
+    install_browser.add_argument("--with-deps", action="store_true", help="Также установить системные библиотеки Linux (могут потребоваться права администратора)")
+    service = sub.add_parser("service", help="Управлять фоновой службой")
+    service_commands = service.add_subparsers(dest="service_command", required=True)
+    for action, description in (("install", "Установить и запустить"), ("start", "Запустить"),
+                                ("stop", "Остановить"), ("status", "Показать состояние"),
+                                ("uninstall", "Удалить")):
+        service_commands.add_parser(action, help=description)
+    run = service_commands.add_parser("run", help="Запуск цикла службы (используется системой)")
+    run.add_argument("--state-dir", type=Path, required=True)
     return result
 
 
@@ -60,6 +77,21 @@ def _secret(prompt):
             return getpass.getpass(prompt)
     except (getpass.GetPassWarning, EOFError, OSError):
         raise ValueError("Не удалось отключить эхо при вводе секрета.") from None
+
+def _choose_login():
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        raise ValueError("Для выбора способа входа нужен терминал.")
+    print("Вход в ИТМО — выберите способ:\n"
+          "1. Веб-вход (рекомендуется): отдельно откроется ITMO.ID; сначала выполните kronbot browser install.\n"
+          "2. Логин и пароль: введите данные в терминале; при MFA используйте веб-вход.\n"
+          "3. Refresh-токен My ITMO: вставьте свой токен; при обмене старый будет инвалидирован.\n"
+          "4. Access-токен My ITMO: вставьте свой токен; автоматически он не продлевается.")
+    try:
+        choice = input("Номер способа (1–4): ").strip()
+        return {"1": "browser", "2": "password", "3": "refresh-token", "4": "access-token"}[choice]
+    except (KeyError, EOFError, OSError):
+        raise ValueError("Способ входа не выбран.") from None
+
 
 
 def _text_login(method):
@@ -105,14 +137,15 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
         print("Локальный вход забыт; серверная сессия не завершена.")
         return 0
     if command == "login":
-        username, secret = ("", "") if args.method == "browser" else _text_login(args.method)
+        method = args.method or _choose_login()
+        username, secret = ("", "") if method == "browser" else _text_login(method)
         sport.check_blocks()
         auth = ItmoAuth(on_restricted=sport._auth_restricted, now=now)
-        if args.method == "browser":
+        if method == "browser":
             session = await auth.login_browser(cancel)
-        elif args.method == "password":
+        elif method == "password":
             session = await auth.login_password(username, secret)
-        elif args.method == "access-token":
+        elif method == "access-token":
             session = await auth.import_access(secret)
         else:
             session = await auth.import_refresh(secret)
@@ -247,6 +280,74 @@ async def _run(args, store):
         await sport.close()
 
 
+
+def _service_manager():
+    if sys.platform == "win32":
+        from . import _service_windows
+        return _service_windows
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+        from . import _service_posix
+        return _service_posix
+    raise RuntimeError("Пользовательская служба не поддерживается на этой платформе.")
+
+
+def _service_executable() -> str:
+    invoked = Path(sys.argv[0])
+    if invoked.name.lower() not in ("kronbot", "kronbot.exe"):
+        found = shutil.which("kronbot")
+        if not found:
+            raise RuntimeError("Установите kronbot через uv tool install . и повторите.")
+        invoked = Path(found)
+    executable = invoked.absolute()
+    if not executable.is_file():
+        raise RuntimeError("Не найден установленный исполняемый файл kronbot.")
+    return os.fspath(executable)
+
+
+def _service_command(args) -> int:
+    action = args.service_command
+    if action == "run":
+        from .service import run_service
+        if not args.state_dir.is_absolute():
+            raise ValueError("Каталог состояния службы должен быть абсолютным.")
+        return asyncio.run(run_service(args.state_dir))
+    manager = _service_manager()
+    directory = state_directory().expanduser().absolute()
+    if action == "status":
+        status = manager.status()
+        print({"running": "Служба запущена", "stopped": "Служба остановлена",
+               "not installed": "Служба не установлена"}[status])
+        if status != "not installed":
+            try:
+                with StateStore(directory) as store:
+                    if store.data["background_paused"]:
+                        print("Автозапись приостановлена из-за ограничения доступа; после окончания блокировки выполните kronbot service start.")
+                    elif store.data["session"] is None:
+                        print("Для автозаписи нужен вход.")
+            except StateLocked:
+                print("Состояние очереди сейчас занято.")
+        return 0
+    if action in ("install", "start"):
+        with StateStore(directory) as store:
+            until = max(store.data["blocked_until"].values(), default=0)
+            if until > time.time():
+                raise NetworkBlocked(until)
+            if action == "install":
+                manager.install(_service_executable(), directory)
+            else:
+                manager.start()
+            if store.data["background_paused"]:
+                store.data["background_paused"] = False
+                store.save()
+        print("Фоновая служба запущена.")
+    elif action == "stop":
+        manager.stop()
+        print("Фоновая служба остановлена.")
+    else:
+        manager.uninstall()
+        print("Фоновая служба удалена; очередь и вход сохранены.")
+    return 0
+
 def main() -> int:
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
@@ -260,9 +361,25 @@ def main() -> int:
         try:
             from .tui import run
         except ImportError:
-            print("Установите TUI из каталога проекта: uv tool install --force '.[tui]'", file=sys.stderr)
+            print("Не найден TUI. Переустановите: uv tool install --force . или pipx reinstall kronbot", file=sys.stderr)
             return 2
         return run()
+    if args.command == "browser":
+        command = [sys.executable, "-m", "playwright", "install"]
+        if args.with_deps:
+            command.append("--with-deps")
+        command.append("chromium")
+        try:
+            return subprocess.run(command, shell=False, check=False).returncode
+        except OSError:
+            print("Не удалось запустить установку Chromium.", file=sys.stderr)
+            return 1
+    if args.command == "service":
+        try:
+            return _service_command(args)
+        except (ValueError, StateError, RuntimeError, LocalLimit) as exc:
+            print(str(exc), file=sys.stderr)
+            return 3 if isinstance(exc, LocalLimit) else 1
     try:
         with StateStore() as store:
             return asyncio.run(_run(args, store))

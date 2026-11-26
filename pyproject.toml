@@ -7,11 +7,13 @@ name = "kronbot"
 version = "0.1.0"
 description = "Автозапись на физкультуру ИТМО из терминала"
 requires-python = ">=3.12.4"
-dependencies = ["httpx>=0.29,<0.30", "portalocker>=4.4,<5", "pywin32>=312,<313; sys_platform == 'win32'"]
-
-[project.optional-dependencies]
-tui = ["textual>=8.2,<9"]
-browser = ["playwright>=1.65,<2"]
+dependencies = [
+    "httpx>=0.29,<0.30",
+    "portalocker>=4.4,<5",
+    "textual>=8.2,<9",
+    "playwright>=1.65,<2",
+    "pywin32>=312,<313; sys_platform == 'win32'",
+]
 
 [project.scripts]
 kronbot = "kronbot.__main__:main"

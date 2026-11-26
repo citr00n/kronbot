@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import asyncio
 
 import httpx
 import pytest
@@ -81,3 +82,87 @@ async def test_login_password_is_masked_and_escape_returns(tmp_path):
             await pilot.press("escape")
             await pilot.pause()
             assert secret.value == ""
+
+
+@pytest.mark.parametrize(
+    ("method", "phrases", "username_visible", "secret_visible"),
+    [
+        ("browser", ("kronbot browser install", "графическая сессия", "sandbox", "отдельном"), False, False),
+        ("password", ("логин", "Пароль скрыт", "веб-вход"), True, True),
+        ("refresh", ("только свой", "скрытое", "ротирован", "сессия"), False, True),
+        ("access", ("только свой", "скрытое", "не продлевается"), False, True),
+    ],
+)
+async def test_login_guide_methods_fit_terminal(method, phrases, username_visible, secret_visible):
+    from textual.app import App
+    from textual.widgets import Button, Input, Select, Static
+    from kronbot.tui import LoginScreen
+
+    class GuideApp(App):
+        CSS = KronbotApp.CSS
+
+        def on_mount(self):
+            self.push_screen(LoginScreen())
+
+    app = GuideApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        screen = app.screen
+        screen.query_one("#method", Select).value = method
+        await pilot.pause()
+        guide = screen.query_one("#login-guide", Static)
+        for phrase in phrases:
+            assert phrase in guide.content
+        assert screen.query_one("#username", Input).display == username_visible
+        secret = screen.query_one("#secret", Input)
+        assert secret.display == secret_visible
+        assert secret.password
+        for widget in (guide, screen.query_one("#submit", Button), screen.query_one("#back", Button)):
+            assert widget.region.bottom <= 24
+            assert widget.region.height > 0
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, LoginScreen)
+
+
+async def test_login_guide_secret_input_and_single_attempt(monkeypatch):
+    from textual.app import App
+    from textual.widgets import Input, Select
+    from kronbot.tui import LoginScreen
+
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    calls = []
+
+    async def login(self, method, username, secret):
+        calls.append((method, username, secret))
+        started.set()
+        await finish.wait()
+
+    monkeypatch.setattr(LoginScreen, "_login", login)
+
+    class GuideApp(App):
+        CSS = KronbotApp.CSS
+
+        def on_mount(self):
+            self.push_screen(LoginScreen())
+
+    app = GuideApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        screen = app.screen
+        screen.query_one("#method", Select).value = "access"
+        await pilot.pause()
+        secret = screen.query_one("#secret", Input)
+        secret.focus()
+        await pilot.press("q", "r", "p", "l")
+        assert secret.value == "qrpl"
+        await pilot.press("enter")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert calls == [("access", "", "qrpl")]
+        assert secret.value == ""
+        await pilot.press("enter")
+        assert len(calls) == 1
+        await pilot.press("escape")
+        assert screen.cancel.is_set()
+        finish.set()
+        await pilot.pause()
+        assert not isinstance(app.screen, LoginScreen)

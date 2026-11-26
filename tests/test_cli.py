@@ -122,3 +122,61 @@ async def test_book_reports_uncertain_post(tmp_path, capsys):
         assert "Проверьте в My ITMO" in output and "private response" not in output
         assert store.data["queues"]["owner"][0]["status"] == "uncertain"
         await client.close()
+
+
+def test_guided_login_selection(monkeypatch, capsys):
+    from kronbot import cli
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "3")
+    assert cli._choose_login() == "refresh-token"
+    output = capsys.readouterr().out
+    assert "инвалидирован" in output and "не продлевается" in output
+
+
+def test_browser_install_uses_current_environment(monkeypatch):
+    from types import SimpleNamespace
+    from kronbot import cli
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["kronbot", "browser", "install"])
+    monkeypatch.setattr(cli.subprocess, "run", lambda args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(returncode=0))
+    assert cli.main() == 0
+    assert calls == [([sys.executable, "-m", "playwright", "install", "chromium"], {"shell": False, "check": False})]
+
+
+def test_service_install_and_resume(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from kronbot import cli
+    directory = tmp_path / "state with spaces"
+    calls = []
+    manager = SimpleNamespace(install=lambda exe, path: calls.append(("install", exe, path)),
+                              start=lambda: calls.append(("start",)))
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    monkeypatch.setattr(cli, "_service_executable", lambda: "/fake/kronbot")
+    monkeypatch.setattr(cli, "state_directory", lambda: directory)
+    assert cli._service_command(parser().parse_args(["service", "install"])) == 0
+    assert calls == [("install", "/fake/kronbot", directory.absolute())]
+    with StateStore(directory) as store:
+        store.data["background_paused"] = True
+        store.save()
+    assert cli._service_command(parser().parse_args(["service", "start"])) == 0
+    with StateStore(directory) as store:
+        assert not store.data["background_paused"]
+    assert calls[-1] == ("start",)
+
+
+def test_failed_service_start_keeps_restriction_pause(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from kronbot import cli
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["background_paused"] = True
+        store.save()
+    def fail():
+        raise RuntimeError("Не удалось запустить службу.")
+    monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(start=fail))
+    monkeypatch.setattr(cli, "state_directory", lambda: directory)
+    with pytest.raises(RuntimeError):
+        cli._service_command(parser().parse_args(["service", "start"]))
+    with StateStore(directory) as store:
+        assert store.data["background_paused"] is True

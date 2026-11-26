@@ -121,7 +121,7 @@ async def browser_login(auth_url: str, callback_url: str, cancel: asyncio.Event)
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        raise BrowserError("Установите Playwright и Chromium или выберите другой способ входа.") from None
+        raise BrowserError("Не найден Playwright. Переустановите kronbot или выберите другой способ входа.") from None
     browser = context = page = None
     try:
         async with async_playwright() as playwright:
@@ -141,4 +141,4 @@ async def browser_login(auth_url: str, callback_url: str, cancel: asyncio.Event)
     except BrowserError:
         raise
     except Exception:
-        raise BrowserError("Не удалось безопасно открыть Chromium. Установите браузер по README или выберите другой способ входа.") from None
+        raise BrowserError("Не удалось безопасно открыть Chromium. Выполните kronbot browser install или выберите другой способ входа.") from None
