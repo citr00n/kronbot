@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ import httpx
 import pytest
 
 from kronbot.cli import execute, parser
-from kronbot.sport import LocalLimit, SportClient
+from kronbot.sport import SportClient
 from kronbot.state import StateStore
 
 
@@ -35,9 +36,9 @@ async def test_queue_and_single_booking(tmp_path, capsys):
     def handler(request):
         if request.method == "POST":
             posts.append(request.content)
-            return httpx.Response(200, json={"error_code": 0, "result": [500001]})
+            return httpx.Response(200, json={"error_code": 0, "result": json.loads(request.content)})
         if request.url.path.endswith("/sign/schedule"):
-            lessons = [{"id": ident, "date": stamp, "section_name": "Секция", "room_name": "Зал", "section_level": 1, "type_id": 2, "available": 1, "signed": False, "can_sign_in": {"can_sign_in": True}} for ident in (500001, 500002)]
+            lessons = [{"id": ident, "date": stamp, "section_name": "Секция", "room_name": "Зал", "section_level": 1, "type_id": 2, "available": 1, "signed": False, "can_sign_in": {"can_sign_in": True}} for ident in (500001, 500002, 500003)]
             return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": lessons}]})
         if request.url.path.endswith("/personal/calendar"):
             return httpx.Response(200, json={"error_code": 0, "result": []})
@@ -54,15 +55,15 @@ async def test_queue_and_single_booking(tmp_path, capsys):
         assert not posts
         assert await run("book", "500001") == 0
         assert posts == [b"[500001]"]
-        with pytest.raises(LocalLimit):
-            await run("book", "500002")
-        assert posts == [b"[500001]"]
+        assert await run("book", "500002") == 0
+        assert posts == [b"[500001]", b"[500002]"]
+        assert await run("queue", "add", "500003") == 0
         capsys.readouterr()
         assert await run("queue", "list") == 0
         output = capsys.readouterr().out
-        assert "500002" in output and "500001" not in output
-        assert await run("queue", "remove", "500002") == 0
-        assert len(posts) == 1
+        assert "500003" in output and "500001" not in output and "500002" not in output
+        assert await run("queue", "remove", "500003") == 0
+        assert len(posts) == 2
         await client.close()
 
 
@@ -234,3 +235,65 @@ def test_cli_warns_when_background_service_is_missing(monkeypatch, tmp_path, cap
     monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(status=lambda: "not installed"))
     assert cli.main() == 3
     assert "Фоновая служба не установлена" in capsys.readouterr().err
+
+
+async def test_queue_forecast_and_disambiguated_removal(tmp_path, capsys):
+    from datetime import timedelta
+    from kronbot.agent import QueueError
+
+    now = 1900000000
+    start = datetime.fromtimestamp(now + 86400, timezone.utc)
+    lesson = {
+        "id": 10, "date": start.isoformat(),
+        "date_end": (start + timedelta(hours=1)).isoformat(),
+        "section_name": "Бег", "room_name": "Зал", "section_level": 1,
+        "type_id": 2, "available": 1, "signed": False,
+        "can_sign_in": {"can_sign_in": True}, "section_id": 1,
+        "lesson_level": 1, "building_id": 2, "room_id": 3,
+        "time_slot_id": 4, "teacher_isu": 5,
+    }
+    def handler(request):
+        assert request.method == "GET"
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [lesson]}]})
+        return httpx.Response(200, json={"error_code": 0, "result": []})
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        async def run(*argv):
+            return await execute(parser().parse_args(list(argv)), store, client, now=lambda: now)
+        assert await run("queue", "add", "10") == 0
+        assert await run("queue", "forecast", "10") == 0
+        queue = store.data["queues"]["owner"]
+        assert len(queue) == 2
+        assert datetime.fromisoformat(queue[1]["starts_at"]) == start + timedelta(days=14)
+        capsys.readouterr()
+        assert await run("queue", "list") == 0
+        output = capsys.readouterr().out
+        assert "прогноз" in output and "[--forecast]" in output and "[--lesson]" in output
+        with pytest.raises(QueueError):
+            await run("queue", "remove", "10")
+        assert await run("queue", "remove", "10", "--lesson") == 0
+        assert len(queue) == 1 and queue[0]["forecast"]["bound"] is False
+        assert await run("queue", "remove", "10", "--forecast") == 0
+        assert not queue
+        lesson.pop("teacher_isu")
+        with pytest.raises(QueueError, match="нельзя создать"):
+            await run("queue", "forecast", "10")
+        await client.close()
+
+
+@pytest.mark.parametrize(("status", "target", "expected"), [
+    ("running", "current", True),
+    ("running", "other", False),
+    ("stopped", "current", False),
+    ("not installed", None, False),
+])
+def test_running_service_requires_running_and_matching_directory(monkeypatch, tmp_path, status, target, expected):
+    from types import SimpleNamespace
+    from kronbot import cli
+    current = tmp_path / "state"
+    path = current if target == "current" else tmp_path / "other" if target else None
+    monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(
+        status=lambda: status, configured_state_dir=lambda: path))
+    assert cli._service_running(current) is expected

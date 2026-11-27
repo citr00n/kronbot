@@ -6,7 +6,7 @@ import json
 import os
 import stat
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import portalocker
@@ -36,6 +36,51 @@ def empty_state():
 
 def _integer(value):
     return type(value) is int
+
+
+def _validate_forecast(forecast, starts_at):
+    if not isinstance(forecast, dict) or set(forecast) != {
+        "bound", "prototype_lesson_id", "section_id", "teacher_isu", "building_id", "room_id",
+        "section_level", "lesson_level", "type_id", "time_slot_id",
+        "prototype_starts_at", "prototype_ends_at", "predicted_ends_at",
+        "teacher_name", "room_name",
+    }:
+        raise ValueError()
+    if type(forecast["bound"]) is not bool or any(
+        not _integer(forecast[key]) or forecast[key] <= 0
+        for key in ("prototype_lesson_id", "section_id", "teacher_isu", "time_slot_id")
+    ):
+        raise ValueError()
+    if (
+        forecast["type_id"] != 2 or type(forecast["type_id"]) is not int
+        or not _integer(forecast["section_level"])
+        or not _integer(forecast["lesson_level"])
+        or not isinstance(forecast["teacher_name"], str)
+        or not isinstance(forecast["room_name"], str)
+    ):
+        raise ValueError()
+    building, room = forecast["building_id"], forecast["room_id"]
+    if not (
+        (_integer(building) and building > 0 and _integer(room) and room > 0)
+        or (building is None or _integer(building) and building == -1)
+        and _integer(room) and room == -1
+    ):
+        raise ValueError()
+    dates = []
+    for key in ("prototype_starts_at", "prototype_ends_at", "predicted_ends_at"):
+        if not isinstance(forecast[key], str):
+            raise ValueError()
+        date = datetime.fromisoformat(forecast[key])
+        if date.utcoffset() is None:
+            raise ValueError()
+        dates.append(date)
+    prototype_start, prototype_end, predicted_end = dates
+    if (
+        prototype_end <= prototype_start
+        or starts_at != prototype_start + timedelta(days=14)
+        or predicted_end != prototype_end + timedelta(days=14)
+    ):
+        raise ValueError()
 
 
 def _validate_state(data):
@@ -84,18 +129,36 @@ def _validate_state(data):
             raise ValueError()
         seen = set()
         for item in queue:
-            if not isinstance(item, dict) or set(item) != {"lesson_id", "section_name", "starts_at", "status", "refusal_code"}:
+            if not isinstance(item, dict) or set(item) not in (
+                {"lesson_id", "section_name", "starts_at", "status", "refusal_code"},
+                {"lesson_id", "section_name", "starts_at", "status", "refusal_code", "forecast"},
+            ):
                 raise ValueError()
             ident = item["lesson_id"]
-            if not _integer(ident) or ident <= 0 or ident in seen:
+            if not _integer(ident) or ident <= 0:
                 raise ValueError()
-            seen.add(ident)
             if not isinstance(item["section_name"], str) or not isinstance(item["starts_at"], str):
                 raise ValueError()
             parsed = datetime.fromisoformat(item["starts_at"])
             if parsed.tzinfo is None or parsed.utcoffset() is None:
                 raise ValueError()
-            if item["status"] not in {"waiting", "uncertain", "booked", "rejected", "expired"}:
+            if "forecast" in item:
+                _validate_forecast(item["forecast"], parsed)
+                if not item["forecast"]["bound"] and item["status"] not in {"waiting", "expired"}:
+                    raise ValueError()
+                if not item["forecast"]["bound"] and ident != item["forecast"]["prototype_lesson_id"]:
+                    raise ValueError()
+            key = (ident, bool(item.get("forecast") and not item["forecast"]["bound"]))
+            if key in seen:
+                raise ValueError()
+            seen.add(key)
+            if item["status"] not in {
+                "waiting",
+                "uncertain",
+                "booked",
+                "rejected",
+                "expired",
+            }:
                 raise ValueError()
             if item["refusal_code"] is not None and not _integer(item["refusal_code"]):
                 raise ValueError()

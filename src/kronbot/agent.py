@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from .auth import AuthError, LoginRequired
-from .sport import Booking, HttpUnauthorized, SportError
+from .sport import Booking, HttpUnauthorized, SportError, forecast_identity
 from .state import StateError
 
 MSK = timezone(timedelta(hours=3))
@@ -36,6 +36,10 @@ def auto_delay(now: float, minimum: float = 120.0) -> float:
 class QueueError(Exception):
     pass
 
+def _unbound_forecast(item):
+    forecast = item.get("forecast")
+    return bool(forecast and not forecast["bound"])
+
 
 class Agent:
     def __init__(self, store, sport, *, now=time.time, monotonic=time.monotonic):
@@ -60,36 +64,159 @@ class Agent:
         if lesson.starts_at <= now or lesson.section_level != 1 or lesson.type_id == 1 or lesson.signed:
             raise QueueError("Занятие недоступно для добавления.")
         queue = self.queue()
-        if any(item["lesson_id"] == lesson.id for item in queue):
+        if any(item["lesson_id"] == lesson.id and not _unbound_forecast(item) for item in queue):
             raise QueueError("Занятие уже есть в очереди.")
         queue.append({"lesson_id": lesson.id, "section_name": lesson.section_name, "starts_at": lesson.starts_at.isoformat(), "status": "waiting", "refusal_code": None})
-        self.store.save()
+        try:
+            self.store.save()
+        except StateError:
+            queue.pop()
+            raise
 
-    def remove(self, lesson_id, *, verified=False):
-        if self.sport.in_flight == lesson_id or lesson_id in self.cancelling_ids:
-            raise QueueError("Запись уже отправлена; дождитесь ответа.")
+    def add_forecast(self, lesson):
+        identity = forecast_identity(lesson)
+        target = lesson.starts_at + timedelta(days=14)
+        if identity is None or lesson.section_level != 1 or target.timestamp() <= self.now():
+            raise QueueError("Для этого занятия нельзя создать надёжный прогноз.")
         queue = self.queue()
-        item = next((x for x in queue if x["lesson_id"] == lesson_id), None)
-        if item is None or item["status"] == "uncertain" and not verified:
-            raise QueueError("Операция неприменима. Проверьте запись в My ITMO.")
-        queue.remove(item)
-        self.store.save()
+        if any(item.get("forecast", {}).get("prototype_lesson_id") == lesson.id for item in queue):
+            raise QueueError("Занятие уже есть в очереди.")
+        forecast = {
+            "bound": False,
+            "prototype_lesson_id": lesson.id,
+            "section_id": lesson.section_id,
+            "teacher_isu": lesson.teacher_isu,
+            "building_id": lesson.building_id,
+            "room_id": lesson.room_id,
+            "section_level": lesson.section_level,
+            "lesson_level": lesson.lesson_level,
+            "type_id": lesson.type_id,
+            "time_slot_id": lesson.time_slot_id,
+            "prototype_starts_at": lesson.starts_at.isoformat(),
+            "prototype_ends_at": lesson.ends_at.isoformat(),
+            "predicted_ends_at": (lesson.ends_at + timedelta(days=14)).isoformat(),
+            "teacher_name": lesson.teacher_name,
+            "room_name": lesson.room_name,
+        }
+        item = {
+            "lesson_id": lesson.id, "section_name": lesson.section_name,
+            "starts_at": target.isoformat(), "status": "waiting",
+            "refusal_code": None, "forecast": forecast,
+        }
+        queue.append(item)
+        try:
+            self.store.save()
+        except StateError:
+            queue.remove(item)
+            raise
 
-    def retry(self, lesson_id, *, verified=False):
-        if self.sport.in_flight == lesson_id or lesson_id in self.cancelling_ids:
+    @staticmethod
+    def _matches_forecast(item, lesson):
+        forecast = item["forecast"]
+        return forecast_identity(lesson) == (
+            forecast["section_id"], forecast["teacher_isu"],
+            None if forecast["room_id"] == -1 else forecast["building_id"],
+            forecast["room_id"],
+            forecast["section_level"], forecast["lesson_level"],
+            forecast["type_id"], forecast["time_slot_id"],
+            datetime.fromisoformat(item["starts_at"]),
+            datetime.fromisoformat(forecast["predicted_ends_at"]),
+        )
+
+    def _bind_forecasts(self, queue, snapshot):
+        # A collision keeps the existing entry, especially an uncertain one.
+        original = queue[:]
+        if getattr(self.sport, "forecast_incomplete", False):
+            return
+        ambiguous_times = getattr(self.sport, "forecast_ambiguous_times", set())
+        changed = []
+        for item in original:
+            forecast = item.get("forecast")
+            if not forecast or forecast["bound"] or item["status"] != "waiting":
+                continue
+            target = datetime.fromisoformat(item["starts_at"])
+            if target in ambiguous_times or any(
+                lesson.starts_at == target and forecast_identity(lesson) is None
+                for lesson in snapshot
+            ):
+                continue
+            matches = [lesson for lesson in snapshot if self._matches_forecast(item, lesson)]
+            if len(matches) != 1:
+                continue
+            lesson = matches[0]
+            existing = next(
+                (other for other in queue if other is not item
+                 and not _unbound_forecast(other) and other["lesson_id"] == lesson.id),
+                None,
+            )
+            if existing is not None:
+                if existing["status"] in {"rejected", "expired"}:
+                    continue
+                queue.remove(item)
+            else:
+                changed.append((item, item["lesson_id"]))
+                item["lesson_id"] = lesson.id
+                forecast["bound"] = True
+        if queue == original and not changed:
+            return
+        try:
+            self.store.save()
+        except StateError:
+            queue[:] = original
+            for item, ident in changed:
+                item["lesson_id"] = ident
+                item["forecast"]["bound"] = False
+            raise
+
+    def remove(self, lesson_id, *, verified=False, forecast=None):
+        queue = self.queue()
+        matches = [x for x in queue if x["lesson_id"] == lesson_id
+                   and (forecast is None or _unbound_forecast(x) == forecast)]
+        if len(matches) != 1:
+            raise QueueError("Укажите однозначную запись очереди.")
+        item = matches[0]
+        if not _unbound_forecast(item) and (
+            self.sport.in_flight == lesson_id or lesson_id in self.cancelling_ids
+        ):
             raise QueueError("Запись уже отправлена; дождитесь ответа.")
-        item = next((x for x in self.queue() if x["lesson_id"] == lesson_id), None)
+        if item["status"] == "uncertain" and not verified:
+            raise QueueError("Операция неприменима. Проверьте запись в My ITMO.")
+        index = queue.index(item)
+        queue.remove(item)
+        try:
+            self.store.save()
+        except StateError:
+            queue.insert(index, item)
+            raise
+
+    def retry(self, lesson_id, *, verified=False, forecast=None):
+        queue = self.queue()
+        matches = [x for x in queue if x["lesson_id"] == lesson_id
+                   and (forecast is None or _unbound_forecast(x) == forecast)]
+        if len(matches) > 1:
+            raise QueueError("Укажите однозначную запись очереди.")
+        item = matches[0] if matches else None
+        if item is not None and not _unbound_forecast(item) and (
+            self.sport.in_flight == lesson_id or lesson_id in self.cancelling_ids
+        ):
+            raise QueueError("Запись уже отправлена; дождитесь ответа.")
         if not verified or item is None or item["status"] != "uncertain" or datetime.fromisoformat(item["starts_at"]).timestamp() <= self.now():
             raise QueueError("Операция неприменима. Проверьте запись в My ITMO.")
         item["status"] = "waiting"
-        self.store.save()
+        try:
+            self.store.save()
+        except StateError:
+            item["status"] = "uncertain"
+            raise
 
     def _confirm(self, queue, ids):
-        confirmed = [item for item in queue if item["lesson_id"] in ids]
+        confirmed = [item for item in queue if item["lesson_id"] in ids
+                     and not _unbound_forecast(item)]
         if not confirmed:
             return
         original = queue[:]
-        queue[:] = [item for item in queue if item["lesson_id"] not in ids]
+        queue[:] = [item for item in queue
+                    if item["lesson_id"] not in ids or _unbound_forecast(item)]
         try:
             self.store.save()
         except StateError:
@@ -164,7 +291,8 @@ class Agent:
             queue = self.queue()
             self.cancelling_ids = ids
             try:
-                existing = {item["lesson_id"]: item for item in queue}
+                existing = {item["lesson_id"]: item for item in queue
+                            if not _unbound_forecast(item)}
                 for item in affected:
                     if item.id not in existing:
                         entry = {
@@ -203,7 +331,8 @@ class Agent:
                 except (AuthError, SportError, StateError) as exc:
                     exc.args = ("Исход отмены неизвестен. Проверьте запись в My ITMO.",)
                     raise
-                queue[:] = [entry for entry in queue if entry["lesson_id"] not in ids]
+                queue[:] = [entry for entry in queue
+                            if entry["lesson_id"] not in ids or _unbound_forecast(entry)]
                 try:
                     self.store.save()
                 except Exception:
@@ -229,7 +358,19 @@ class Agent:
             self.snapshot = snapshot
             self.last_check = self.now()
             by_id = {lesson.id: lesson for lesson in snapshot}
-            if only_lesson_id is not None and not any(x["lesson_id"] == only_lesson_id for x in queue):
+            originally_targeted = only_lesson_id is not None and any(
+                item["lesson_id"] == only_lesson_id and not _unbound_forecast(item)
+                for item in queue
+            )
+            self._bind_forecasts(queue, snapshot)
+            if originally_targeted and not any(
+                item["lesson_id"] == only_lesson_id and not _unbound_forecast(item)
+                for item in queue
+            ):
+                return
+            if only_lesson_id is not None and not any(
+                x["lesson_id"] == only_lesson_id and not _unbound_forecast(x) for x in queue
+            ):
                 lesson = by_id.get(only_lesson_id)
                 if lesson is None:
                     raise QueueError("Занятие не найдено в расписании.")
@@ -241,7 +382,9 @@ class Agent:
             signed_ids = {
                 item["lesson_id"]
                 for item in queue
+                if not (item.get("forecast") and not item["forecast"]["bound"])
                 if (lesson := by_id.get(item["lesson_id"])) is not None
+                and (not item.get("forecast") or self._matches_forecast(item, lesson))
                 and lesson.signed
             }
             self._confirm(queue, signed_ids)
@@ -255,6 +398,12 @@ class Agent:
             candidates = []
             for item in queue:
                 lesson = by_id.get(item["lesson_id"])
+                if item.get("forecast") and (
+                    not item["forecast"]["bound"]
+                    or lesson is None
+                    or not self._matches_forecast(item, lesson)
+                ):
+                    continue
                 if (item["status"] == "waiting" and lesson is not None and lesson.starts_at.timestamp() > now
                         and lesson.section_level == 1 and lesson.type_id != 1 and lesson.available > 0
                         and not lesson.signed and lesson.can_sign_in
@@ -271,6 +420,7 @@ class Agent:
                 {
                     item["lesson_id"]
                     for item in queue
+                    if not (item.get("forecast") and not item["forecast"]["bound"])
                     if item["lesson_id"] in ids
                 },
             )
@@ -281,9 +431,10 @@ class Agent:
                 if item not in queue or item["status"] != "waiting":
                     continue
                 category = lesson.type_id == 5
-                if category not in categories:
-                    categories[category] = await self.sport.can_spend_attempt(lesson.type_id)
-                if not categories[category]:
+                if categories.get(category) is False:
+                    continue
+                if not await self.sport.can_spend_attempt(lesson.type_id):
+                    categories[category] = False
                     continue
                 def permitted():
                     current = self.store.data["session"]
@@ -296,7 +447,11 @@ class Agent:
                     result = await self.sport.enroll(lesson.id, item, before_post=permitted)
                 except HttpUnauthorized:
                     item["status"] = "waiting"
-                    self.store.save()
+                    try:
+                        self.store.save()
+                    except StateError:
+                        item["status"] = "uncertain"
+                        raise
                     await self.sport.refresh()
                     return
                 except SportError:
@@ -309,5 +464,10 @@ class Agent:
                         result.status,
                         result.refusal_code,
                     )
-                    self.store.save()
-                return
+                    try:
+                        self.store.save()
+                    except StateError:
+                        item["status"], item["refusal_code"] = "uncertain", None
+                        raise
+                if only_lesson_id is not None or result.status == "uncertain":
+                    return
