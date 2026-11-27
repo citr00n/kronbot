@@ -20,6 +20,7 @@ from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .login_guides import LOGIN_GUIDE
+from .notifications import validate_url
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text, forecast_prototypes
 from .state import StateError, StateLocked, StateStore, state_directory
 from .updates import check_update
@@ -83,6 +84,11 @@ def parser():
     browser_commands = browser.add_subparsers(dest="browser_command", required=True)
     install_browser = browser_commands.add_parser("install", help="Установить Chromium")
     install_browser.add_argument("--with-deps", action="store_true", help="Также установить системные библиотеки Linux (могут потребоваться права администратора)")
+    ntfy = sub.add_parser("ntfy", help="Управлять уведомлениями ntfy")
+    ntfy_commands = ntfy.add_subparsers(dest="ntfy_command", required=True)
+    ntfy_commands.add_parser("set", help="Настроить уведомления")
+    ntfy_commands.add_parser("status", help="Показать состояние уведомлений")
+    ntfy_commands.add_parser("disable", help="Отключить уведомления")
     service = sub.add_parser("service", help="Управлять фоновой службой")
     service_commands = service.add_subparsers(dest="service_command", required=True)
     for action, description in (("install", "Установить и запустить"), ("start", "Запустить"),
@@ -103,6 +109,42 @@ def _secret(prompt):
             return getpass.getpass(prompt)
     except (getpass.GetPassWarning, EOFError, OSError):
         raise ValueError("Не удалось отключить эхо при вводе секрета.") from None
+
+def _ntfy_command(args, store):
+    if args.ntfy_command == "status":
+        settings = store.data["ntfy"]
+        if settings is None:
+            print("Уведомления ntfy отключены.")
+        else:
+            print("Уведомления ntfy включены.")
+            if settings["last_error"] is not None:
+                print("Последняя ошибка приложения отмечена для уведомления.")
+        return 0
+    if args.ntfy_command == "disable":
+        settings = None
+    else:
+        if not sys.stdin.isatty() or not sys.stderr.isatty():
+            raise ValueError("Для безопасного ввода нужен терминал.")
+        try:
+            url = input("HTTPS URL канала ntfy: ")
+        except (EOFError, OSError):
+            raise ValueError("Не удалось прочитать адрес канала ntfy.") from None
+        try:
+            url = validate_url(url)
+        except ValueError:
+            raise ValueError("Некорректный HTTPS URL канала ntfy.") from None
+        token = _secret("Bearer-токен ntfy (необязательно): ") or None
+        settings = {"url": url, "token": token, "last_error": None}
+    old = store.data["ntfy"]
+    store.data["ntfy"] = settings
+    try:
+        store.save()
+    except StateError:
+        store.data["ntfy"] = old
+        raise
+    print("Уведомления ntfy отключены." if settings is None else "Уведомления ntfy настроены.")
+    return 0
+
 
 def _choose_login():
     if not sys.stdin.isatty() or not sys.stderr.isatty():
@@ -595,6 +637,13 @@ def main() -> int:
         for stream in (sys.stdout, sys.stderr):
             if not stream.isatty() and hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8")
+    if len(sys.argv) > 1 and sys.argv[1] == "ntfy":
+        ntfy_args = sys.argv[2:]
+        if not (ntfy_args in ([], ["-h"], ["--help"])
+                or (ntfy_args[0] in ("set", "status", "disable")
+                    and (len(ntfy_args) == 1 or ntfy_args[1:] in (["-h"], ["--help"])))):
+            print("Используйте ntfy set, status или disable без дополнительных аргументов.", file=sys.stderr)
+            return 2
     args = parser().parse_args()
     if args.command in (None, "tui"):
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -606,7 +655,7 @@ def main() -> int:
             print("Не найден TUI. Переустановите: uv tool install --force . или pipx reinstall kronbot", file=sys.stderr)
             return 2
         return run()
-    if (args.command not in ("browser", "book", "watch", "service")
+    if (args.command not in ("browser", "book", "watch", "service", "ntfy")
             and sys.stdin.isatty() and sys.stderr.isatty()):
         _interactive_update_notice()
     if args.command == "doctor":
@@ -620,6 +669,16 @@ def main() -> int:
             return subprocess.run(command, shell=False, check=False).returncode
         except OSError:
             print("Не удалось запустить установку Chromium.", file=sys.stderr)
+            return 1
+    if args.command == "ntfy":
+        try:
+            with StateStore() as store:
+                return _ntfy_command(args, store)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except (StateLocked, StateError) as exc:
+            print(str(exc), file=sys.stderr)
             return 1
     if args.command == "service":
         try:

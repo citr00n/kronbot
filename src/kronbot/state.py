@@ -11,6 +11,8 @@ from pathlib import Path
 
 import portalocker
 
+from .notifications import validate_url
+
 
 class StateError(Exception):
     pass
@@ -31,7 +33,8 @@ def state_directory() -> Path:
 
 def empty_state():
     return {"version": 1, "session": None, "queues": {}, "sport_request_times": [],
-            "last_enroll_at": None, "blocked_until": {}, "background_paused": False}
+            "last_enroll_at": None, "blocked_until": {}, "background_paused": False,
+            "ntfy": None}
 
 
 def _integer(value):
@@ -88,6 +91,16 @@ def _validate_state(data):
         raise ValueError()
     if type(data["background_paused"]) is not bool:
         raise ValueError()
+    ntfy = data["ntfy"]
+    if ntfy is not None:
+        if not isinstance(ntfy, dict) or set(ntfy) != {"url", "token", "last_error"}:
+            raise ValueError()
+        if not isinstance(ntfy["url"], str):
+            raise ValueError()
+        validate_url(ntfy["url"])
+        if any(value is not None and not isinstance(value, str)
+               for value in (ntfy["token"], ntfy["last_error"])):
+            raise ValueError()
     session = data["session"]
     if session is not None:
         if not isinstance(session, dict) or set(session) not in ({
@@ -220,6 +233,8 @@ class StateStore:
                     outer = json.loads(raw)
                 if isinstance(outer, dict) and "background_paused" not in outer:
                     outer["background_paused"] = False
+                if isinstance(outer, dict) and "ntfy" not in outer:
+                    outer["ntfy"] = None
                 _validate_state(outer)
                 self.data = outer
             return self

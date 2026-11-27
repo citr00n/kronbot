@@ -621,7 +621,7 @@ async def test_sport_filter_ignores_outdated_response(tmp_path):
         await app.sport.close()
 
 
-async def test_forecast_key_adds_future_lesson_and_reports_invalid(tmp_path):
+async def test_forecast_row_adds_future_lesson(tmp_path):
     from datetime import timedelta
     from unittest.mock import AsyncMock
     from kronbot.sport import Lesson
@@ -645,11 +645,15 @@ async def test_forecast_key_adds_future_lesson_and_reports_invalid(tmp_path):
             await pilot.pause()
             table = app.query_one("#schedule", DataTable)
             table.focus()
-            await pilot.press("f")
+            await pilot.press("f", "u", "l")
+            assert not app.agent.queue() and store.data["session"] is not None
+            table.move_cursor(row=table.get_row_index("forecast:10"))
+            await pilot.press("enter")
             item = app.agent.queue()[0]
             assert item["forecast"]["bound"] is False
             assert datetime.fromisoformat(item["starts_at"]) == starts + timedelta(days=14)
             assert "прогноз" in str(app.query_one("#queue", DataTable).get_row("10:forecast")[-1]).lower()
+            table.move_cursor(row=table.get_row_index("10"))
             await pilot.press("enter")
             queue = app.query_one("#queue", DataTable)
             assert queue.row_count == 2
@@ -661,13 +665,6 @@ async def test_forecast_key_adds_future_lesson_and_reports_invalid(tmp_path):
             queue.move_cursor(row=queue.get_row_index("10:lesson"))
             app.action_remove()
             assert len(app.agent.queue()) == 1 and app.agent.queue()[0].get("forecast")
-            tabs.active = "schedule-tab"
-            await pilot.pause()
-            table.focus()
-            table.move_cursor(row=1)
-            await pilot.press("f")
-            assert "нельзя создать" in app.error
-            assert len(app.agent.queue()) == 1
             app._remove("10:forecast", True)
             assert not app.agent.queue()
         await app.sport.close()
@@ -865,4 +862,136 @@ async def test_update_notice_on_login_without_service_interference(tmp_path, mon
             assert "Служба недоступна" in str(app.screen.query_one("#service-notice", Static).render())
             assert store.data["session"] is None
             assert not app.auto
+        await app.sport.close()
+
+
+async def test_calendar_navigation_forecast_and_reset(tmp_path):
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+    from textual.widgets import TabbedContent
+    from kronbot.sport import Booking, Lesson
+
+    now = int(datetime(2030, 12, 20, tzinfo=timezone.utc).timestamp())
+    start = datetime(2030, 12, 31, 22, tzinfo=timezone.utc)
+    lesson = Lesson(
+        42, "Плавание", "Бассейн", start, 1, 2, 0, False, False, True,
+        section_id=10, lesson_level=1, building_id=2, room_id=3,
+        time_slot_id=4, teacher_isu=5, ends_at=start + timedelta(hours=1),
+    )
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.agent.snapshot = [lesson]
+            app.stale = False
+            app.agent.add_forecast(lesson)
+            app.bookings_snapshot = [Booking(99, start, "Другое", "Зал", 1, 1)]
+            app._render()
+            tabs = app.query_one(TabbedContent)
+            from textual.widgets import TabPane
+            assert [pane.id for pane in tabs.query(TabPane)][:2] == ["schedule-tab", "calendar-tab"]
+            tabs.active = "calendar-tab"
+            await pilot.pause()
+            await pilot.click("#calendar-next")
+            await pilot.pause()
+            assert (app.calendar_month.year, app.calendar_month.month) == (2031, 1)
+            table = app.query_one("#calendar", DataTable)
+
+            def coordinate(day):
+                return next((r, week.index(day)) for r, week in enumerate(app.calendar_days) if day in week)
+
+            actual = coordinate(1)
+            forecast = coordinate(15)
+            assert "А" in str(table.get_cell_at(actual))
+            assert str(table.get_cell_at(actual).style) == "green"
+            assert "П" in str(table.get_cell_at(forecast))
+            assert "О" in str(table.get_cell_at(forecast))
+            assert "А" not in str(table.get_cell_at(forecast))
+            assert str(table.get_cell_at(forecast).style) == "yellow"
+            from dataclasses import replace
+            app.agent.snapshot.append(replace(
+                lesson, id=44, starts_at=start + timedelta(days=2),
+                ends_at=lesson.ends_at + timedelta(days=2), available=1,
+            ))
+            app._render()
+            assert str(table.get_cell_at(coordinate(3)).style) == "bright_blue"
+            assert str(table.get_cell_at(coordinate(17)).style) == "magenta"
+            app.agent.snapshot.pop()
+            app._render()
+            table.focus()
+            table.move_cursor(row=forecast[0], column=forecast[1])
+            app._render()
+            assert table.cursor_coordinate == forecast
+            await pilot.press("enter")
+            await pilot.pause()
+            schedule = app.query_one("#schedule", DataTable)
+            assert tabs.active == "schedule-tab"
+            assert app.selected_date.isoformat() == "2031-01-15"
+            assert app._selected(schedule) == "forecast:42"
+            assert schedule.region.height > 0 and schedule.region.bottom <= 24
+            await pilot.click("#filter-clear")
+            await pilot.pause()
+            assert app.selected_date is None and schedule.row_count == 2
+
+            tabs.active = "calendar-tab"
+            await pilot.pause()
+            empty = coordinate(2)
+            table.move_cursor(row=empty[0], column=empty[1])
+            table.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.selected_date.isoformat() == "2031-01-02"
+            assert "Нет занятий по фильтрам" in str(schedule.get_row_at(0)[1])
+            tabs.active = "calendar-tab"
+            await pilot.pause()
+            await pilot.click("#calendar-clear")
+            await pilot.pause()
+            assert app.selected_date is None and tabs.active == "schedule-tab"
+        await app.sport.close()
+
+
+async def test_ntfy_settings_in_account(tmp_path):
+    from unittest.mock import AsyncMock
+    from textual.widgets import Input, Static, TabbedContent
+    from kronbot.tui import NtfyScreen
+
+    now = 1900000000
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "account-tab"
+            await pilot.pause()
+            await pilot.click("#account-ntfy")
+            assert isinstance(app.screen, NtfyScreen)
+            url = app.screen.query_one("#ntfy-url", Input)
+            token = app.screen.query_one("#ntfy-token", Input)
+            assert url.password and token.password
+            for widget in (url, token, app.screen.query_one("#ntfy-save"), app.screen.query_one("#ntfy-disable")):
+                assert widget.region.height > 0 and widget.region.bottom <= 24
+            url.value = "http://invalid.example/topic"
+            await pilot.click("#ntfy-save")
+            assert "HTTPS" in str(app.screen.query_one("#ntfy-error", Static).render())
+            assert store.data["ntfy"] is None
+            url.value = "https://ntfy.example/private-topic"
+            token.value = "secret-token"
+            token.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert store.data["ntfy"]["token"] == "secret-token"
+            assert "включены" in str(app.query_one("#account", Static).render())
+            await pilot.click("#account-ntfy")
+            await pilot.press("escape")
+            assert store.data["ntfy"]["token"] == "secret-token"
+            await pilot.click("#account-ntfy")
+            await pilot.click("#ntfy-disable")
+            await pilot.pause()
+            assert store.data["ntfy"] is None
+            assert "отключены" in str(app.query_one("#account", Static).render())
         await app.sport.close()
