@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kronbot"
-version = "0.3.2"
+version = "0.4.0"
 description = "Автозапись на физкультуру ИТМО из терминала"
 readme = "README.md"
 license = "MIT"
