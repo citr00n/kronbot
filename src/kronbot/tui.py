@@ -1,10 +1,11 @@
 """Терминальный интерфейс kronbot."""
 
 import asyncio
+import calendar
 import sys
 import time
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -17,6 +18,7 @@ from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .login_guides import LOGIN_GUIDE
+from .notifications import validate_url
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text, forecast_prototypes
 from .state import StateError, StateLocked, StateStore
 from .updates import check_update
@@ -151,6 +153,66 @@ class LoginScreen(ModalScreen):
             self.dismiss(False)
 
 
+class NtfyScreen(ModalScreen[bool]):
+    BINDINGS = [("escape", "back", "Назад")]
+
+    def compose(self):
+        settings = self.app.store.data["ntfy"]
+        with Vertical(classes="dialog"):
+            yield Label("Уведомления ntfy")
+            yield Static("HTTPS-адрес топика и необязательный bearer-токен вводятся скрыто.", markup=False)
+            yield Input(value=settings["url"] if settings else "", placeholder="HTTPS URL топика", password=True, id="ntfy-url")
+            yield Input(value=(settings["token"] or "") if settings else "", placeholder="Bearer-токен (необязательно)", password=True, id="ntfy-token")
+            yield Static("", id="ntfy-error", markup=False)
+            with Horizontal():
+                yield Button("Сохранить", id="ntfy-save", variant="primary")
+                yield Button("Отключить", id="ntfy-disable")
+                yield Button("Назад", id="ntfy-back")
+
+    def on_input_submitted(self, event):
+        if event.input.id == "ntfy-url":
+            self.query_one("#ntfy-token", Input).focus()
+        else:
+            self._save()
+
+    def on_button_pressed(self, event):
+        if event.button.id == "ntfy-back":
+            self.action_back()
+        elif event.button.id == "ntfy-disable":
+            self._save(disable=True)
+        elif event.button.id == "ntfy-save":
+            self._save()
+
+    def _save(self, *, disable=False):
+        if disable:
+            settings = None
+        else:
+            try:
+                url = validate_url(self.query_one("#ntfy-url", Input).value)
+            except ValueError:
+                self.query_one("#ntfy-error", Static).update("Некорректный HTTPS URL топика ntfy.")
+                return
+            token = self.query_one("#ntfy-token", Input).value or None
+            settings = {"url": url, "token": token, "last_error": None}
+        store = self.app.store
+        old = store.data["ntfy"]
+        store.data["ntfy"] = settings
+        try:
+            store.save()
+        except StateError:
+            store.data["ntfy"] = old
+            self.query_one("#ntfy-error", Static).update("Не удалось сохранить настройки ntfy.")
+            return
+        self.dismiss(True)
+
+    def on_unmount(self):
+        for field in self.query(Input):
+            field.value = ""
+
+    def action_back(self):
+        self.dismiss(False)
+
+
 class KronbotApp(App):
     CSS = """
     Screen { layout: vertical; }
@@ -170,17 +232,19 @@ class KronbotApp(App):
     #filter-type { width: 18; }
     #filter-options Select { width: 1fr; }
     #filter-clear { width: 14; min-width: 14; }
+    #date-filter { height: 1; }
+    #calendar-controls { height: 3; }
+    #calendar-month { width: 1fr; content-align: center middle; }
+    #calendar-legend { height: auto; }
+    #calendar { height: 1fr; }
     #account { height: auto; padding: 1; }
     #account-actions { height: 3; }
     """
     BINDINGS = [
         ("p", "pause", "Авто"),
-        ("f", "forecast", "Прогноз +14д"),
         ("/", "search", "Поиск"),
         ("r", "refresh", "Обновить"),
         ("x", "remove", "Удалить"),
-        ("l", "login", "Вход"),
-        ("u", "logout", "Забыть вход"),
         ("q", "quit_safe", "Выход"),
         Binding("ctrl+c", "quit_safe", "Выход", priority=True),
     ]
@@ -229,6 +293,10 @@ class KronbotApp(App):
         self.filter_task = None
         self.schedule_selection = None
         self.hidden_schedule_selection = None
+        self.selected_date = None
+        today = datetime.fromtimestamp(now(), MSK).date()
+        self.calendar_month = today.replace(day=1)
+        self.calendar_days = []
         self.stopping = False
 
     def compose(self):
@@ -248,7 +316,25 @@ class KronbotApp(App):
                     yield Select([("Места: любые", "all"), ("Места: есть", "yes"), ("Места: нет", "no")], value="all", allow_blank=False, id="filter-places")
                     yield Select([("Время: любое", "all"), ("До 12:00", "morning"), ("12:00–17:59", "day"), ("С 18:00", "evening")], value="all", allow_blank=False, id="filter-time")
                     yield Button("Сброс", id="filter-clear")
+                yield Static("", id="date-filter", markup=False)
                 yield DataTable(id="schedule", cursor_type="row")
+            with TabPane("Календарь", id="calendar-tab"):
+                with Horizontal(id="calendar-controls"):
+                    yield Button("◀", id="calendar-prev")
+                    yield Static("", id="calendar-month", markup=False)
+                    yield Button("▶", id="calendar-next")
+                    yield Button("Все даты", id="calendar-clear")
+                yield Static(
+                    Text.assemble(
+                        "Приоритет →: ",
+                        ("А — запись", "green"), ", ",
+                        ("О — очередь", "yellow"), ", ",
+                        ("М — места (свободные)", "bright_blue"), ", ",
+                        ("П — прогноз", "magenta"), ".",
+                    ),
+                    id="calendar-legend", markup=False,
+                )
+                yield DataTable(id="calendar", cursor_type="cell")
             with TabPane("Очередь", id="queue-tab"):
                 yield DataTable(id="queue", cursor_type="row")
             with TabPane("Записи", id="bookings-tab"):
@@ -258,10 +344,12 @@ class KronbotApp(App):
                 with Horizontal(id="account-actions"):
                     yield Button("Вход", id="account-login")
                     yield Button("Забыть вход", id="account-logout")
+                    yield Button("ntfy", id="account-ntfy")
         yield Footer()
 
     def on_mount(self):
         self.query_one("#schedule", DataTable).add_columns("ID", "МСК", "Секция", "Зал", "Места", "Доступность", "Очередь")
+        self.query_one("#calendar", DataTable).add_columns("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
         self.query_one("#queue", DataTable).add_columns("ID", "МСК", "Секция", "Статус")
         self.query_one("#bookings", DataTable).add_columns("ID", "МСК", "Секция", "Зал")
         self._render()
@@ -318,7 +406,8 @@ class KronbotApp(App):
             f"Состояние: {'вход выполнен' if session else 'нужен вход'}\n"
             f"Номер ИСУ: {isu or 'не указан'}\n"
             f"Срок сессии (МСК):{expiry or ' не указан'}\n"
-            f"Автозапись: {'включена' if self.auto else 'на паузе'}"
+            f"Автозапись: {'включена' if self.auto else 'на паузе'}\n"
+            f"Уведомления ntfy: {'включены' if self.store.data['ntfy'] else 'отключены'}"
         )
         stale = (
             self.bookings_stale
@@ -334,6 +423,11 @@ class KronbotApp(App):
             "\n".join(message for message in messages if message)
         )
         queue = self.agent.queue() if session else []
+        self.query_one("#date-filter", Static).update(
+            f"Дата (МСК): {self.selected_date.strftime('%d.%m.%Y')} — «Сброс» покажет все даты"
+            if self.selected_date else "Дата: все (выбор во вкладке «Календарь»)"
+        )
+        self._render_calendar(queue)
         table = self.query_one("#schedule", DataTable)
         scroll = (table.scroll_x, table.scroll_y)
         selected = self.hidden_schedule_selection or self._selected(table) or self.schedule_selection
@@ -426,6 +520,8 @@ class KronbotApp(App):
         places = self.query_one("#filter-places", Select).value
         period = self.query_one("#filter-time", Select).value
         starts_at = lesson.starts_at + timedelta(days=14) if forecast else lesson.starts_at
+        if self.selected_date is not None and starts_at.astimezone(MSK).date() != self.selected_date:
+            return False
         hour = starts_at.astimezone(MSK).hour
         return (
             (not search or search in clean_text(lesson.section_name).casefold()
@@ -458,16 +554,89 @@ class KronbotApp(App):
         elif event.select.id in ("filter-sign", "filter-places", "filter-time"):
             self._render()
 
+    def _render_calendar(self, queue):
+        marks = {}
+
+        def mark(day, symbol):
+            marks.setdefault(day, set()).add(symbol)
+
+        for lesson in self.agent.snapshot:
+            day = lesson.starts_at.astimezone(MSK).date()
+            if lesson.available > 0 and lesson.can_sign_in and not lesson.signed:
+                mark(day, "М")
+            if lesson.signed:
+                mark(day, "А")
+        for lesson in forecast_prototypes(self.agent.snapshot, self.now()):
+            mark((lesson.starts_at + timedelta(days=14)).astimezone(MSK).date(), "П")
+        for item in queue:
+            day = datetime.fromisoformat(item["starts_at"]).astimezone(MSK).date()
+            mark(day, "О")
+        for booking in self.bookings_snapshot:
+            mark(booking.starts_at.astimezone(MSK).date(), "А")
+
+        month = self.calendar_month
+        self.query_one("#calendar-month", Static).update(month.strftime("%m.%Y") + " (МСК)")
+        table = self.query_one("#calendar", DataTable)
+        cursor = table.cursor_coordinate
+        table.clear()
+        self.calendar_days = calendar.monthcalendar(month.year, month.month)
+        for week in self.calendar_days:
+            cells = []
+            for day in week:
+                if not day:
+                    cells.append(Text(""))
+                    continue
+                current = date(month.year, month.month, day)
+                day_marks = marks.get(current, ())
+                symbols = "".join(symbol for symbol in "МПОА" if symbol in day_marks)
+                color = next((color for mark, color in (("А", "green"), ("О", "yellow"), ("М", "bright_blue"), ("П", "magenta")) if mark in day_marks), None)
+                cells.append(Text(f"{day:02d} {symbols}", style=color))
+            table.add_row(*cells)
+        table.move_cursor(row=min(cursor.row, len(self.calendar_days) - 1), column=cursor.column, scroll=False)
+
+    def _change_calendar_month(self, delta):
+        month = self.calendar_month
+        index = (month.year - 1) * 12 + month.month - 1 + delta
+        if 0 <= index < 9999 * 12:
+            self.calendar_month = date(index // 12 + 1, index % 12 + 1, 1)
+            self._render()
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected):
+        if event.data_table.id != "calendar":
+            return
+        row, column = event.coordinate
+        day = self.calendar_days[row][column]
+        if not day:
+            return
+        self.selected_date = self.calendar_month.replace(day=day)
+        self.hidden_schedule_selection = None
+        self.schedule_selection = None
+        self._render()
+        self.query_one(TabbedContent).active = "schedule-tab"
+        self.query_one("#schedule", DataTable).focus()
+
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "filter-clear":
+            self.selected_date = None
             self.query_one("#filter-search", Input).value = ""
             for selector in ("#filter-type", "#filter-sign", "#filter-places", "#filter-time"):
                 self.query_one(selector, Select).value = "all"
             self._render()
+        elif event.button.id == "calendar-prev":
+            self._change_calendar_month(-1)
+        elif event.button.id == "calendar-next":
+            self._change_calendar_month(1)
+        elif event.button.id == "calendar-clear":
+            self.selected_date = None
+            self._render()
+            self.query_one(TabbedContent).active = "schedule-tab"
+            self.query_one("#schedule", DataTable).focus()
         elif event.button.id == "account-login":
             self.action_login()
         elif event.button.id == "account-logout":
             self.action_logout()
+        elif event.button.id == "account-ntfy":
+            self.push_screen(NtfyScreen(), lambda _: self._render())
 
     def action_search(self):
         if self.query_one(TabbedContent).active == "schedule-tab":
@@ -799,26 +968,6 @@ class KronbotApp(App):
         self.agent.cancel_enabled = True
         self._render()
 
-    def action_forecast(self):
-        if self.query_one(TabbedContent).active != "schedule-tab" or not self.store.data["session"]:
-            return
-        key = self._selected(self.query_one("#schedule", DataTable))
-        if not key:
-            return
-        try:
-            if self.stale or self.filter_stale:
-                raise QueueError("Расписание устарело. Обновите его.")
-            is_forecast = key.startswith("forecast:")
-            candidates = forecast_prototypes(self.agent.snapshot, self.now()) if is_forecast else self.agent.snapshot
-            lesson = next((x for x in candidates if (f"forecast:{x.id}" if is_forecast else str(x.id)) == key and self._matches_filters(x, forecast=is_forecast)), None)
-            if lesson is None:
-                raise QueueError("Занятие не найдено в актуальном расписании.")
-            self.agent.add_forecast(lesson)
-            self.error = "Прогноз занятия добавлен в очередь."
-        except (QueueError, LoginRequired, StateError) as exc:
-            self.error = str(exc)
-        self._render()
-        self._tick()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         if event.data_table.id == "schedule" and event.row_key.value:

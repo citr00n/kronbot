@@ -470,3 +470,106 @@ def test_update_checker_failure_is_silent(monkeypatch, capsys):
     monkeypatch.setattr(cli, "check_update", fail)
     cli._interactive_update_notice()
     assert not capsys.readouterr().err
+
+
+def test_ntfy_set_status_disable_without_itmo_login(monkeypatch, tmp_path, capsys):
+    from kronbot import cli
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "https://example.com/private-topic")
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "synthetic-bearer")
+    with StateStore(tmp_path / "state") as store:
+        assert cli._ntfy_command(parser().parse_args(["ntfy", "set"]), store) == 0
+        assert store.data["ntfy"] == {
+            "url": "https://example.com/private-topic", "token": "synthetic-bearer",
+            "last_error": None,
+        }
+    with StateStore(tmp_path / "state") as store:
+        store.data["ntfy"]["last_error"] = "private-topic synthetic-bearer"
+        store.save()
+        assert cli._ntfy_command(parser().parse_args(["ntfy", "status"]), store) == 0
+        assert cli._ntfy_command(parser().parse_args(["ntfy", "disable"]), store) == 0
+    with StateStore(tmp_path / "state") as store:
+        assert store.data["ntfy"] is None
+        assert cli._ntfy_command(parser().parse_args(["ntfy", "status"]), store) == 0
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "включены" in output and "ошибка" in output and "отключены" in output
+    assert "private-topic" not in output and "synthetic-bearer" not in output
+
+
+def test_ntfy_set_empty_token_and_invalid_url(monkeypatch, tmp_path, capsys):
+    from kronbot import cli
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "")
+    monkeypatch.setattr("builtins.input", lambda prompt: "https://example.com/topic")
+    args = parser().parse_args(["ntfy", "set"])
+    with StateStore(tmp_path / "state") as store:
+        assert cli._ntfy_command(args, store) == 0
+        previous = store.data["ntfy"]
+        assert previous["token"] is None
+        monkeypatch.setattr("builtins.input", lambda prompt: "http://example.com/private-topic")
+        with pytest.raises(ValueError) as error:
+            cli._ntfy_command(args, store)
+        assert "private-topic" not in str(error.value)
+        assert store.data["ntfy"] == previous
+    assert "private-topic" not in capsys.readouterr().out
+
+
+def test_ntfy_set_requires_tty_and_rejects_getpass_fallback(monkeypatch, tmp_path):
+    import warnings
+    from kronbot import cli
+
+    args = parser().parse_args(["ntfy", "set"])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    with StateStore(tmp_path / "state") as store:
+        with pytest.raises(ValueError, match="терминал"):
+            cli._ntfy_command(args, store)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda prompt: "https://example.com/topic")
+        def insecure_getpass(prompt):
+            warnings.warn("echo fallback", cli.getpass.GetPassWarning)
+            return "secret"
+        monkeypatch.setattr(cli.getpass, "getpass", insecure_getpass)
+        with pytest.raises(ValueError, match="эхо"):
+            cli._ntfy_command(args, store)
+        assert store.data["ntfy"] is None
+
+
+@pytest.mark.parametrize("action", ["set", "disable"])
+def test_ntfy_save_failure_restores_previous_settings(monkeypatch, tmp_path, action):
+    from kronbot import cli
+    from kronbot.state import StateError
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "https://example.com/new-topic")
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "new-token")
+    with StateStore(tmp_path / "state") as store:
+        previous = {"url": "https://example.com/old-topic", "token": "old-token", "last_error": None}
+        store.data["ntfy"] = previous
+        store.save()
+        def fail_save():
+            raise StateError("Ошибка сохранения")
+        monkeypatch.setattr(store, "save", fail_save)
+        with pytest.raises(StateError):
+            cli._ntfy_command(parser().parse_args(["ntfy", action]), store)
+        assert store.data["ntfy"] == previous
+    with StateStore(tmp_path / "state") as store:
+        assert store.data["ntfy"] == previous
+
+
+def test_ntfy_cli_never_accepts_secrets_as_arguments_or_pipe(tmp_path):
+    env = {**os.environ, "KRONBOT_STATE_DIR": str(tmp_path / "state")}
+    result = invoke("ntfy", "set", "https://example.com/private-topic", "synthetic-bearer", env=env)
+    assert result.returncode == 2
+    assert "private-topic" not in result.stdout + result.stderr
+    assert "synthetic-bearer" not in result.stdout + result.stderr
+    result = invoke("ntfy", "set", input="https://example.com/private-topic\nsynthetic-bearer\n", env=env)
+    assert result.returncode == 2
+    assert "private-topic" not in result.stdout + result.stderr
+    assert "synthetic-bearer" not in result.stdout + result.stderr

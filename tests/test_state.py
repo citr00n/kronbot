@@ -123,3 +123,51 @@ def test_invalid_forecast_state_is_rejected(tmp_path, field, value):
         }]
         with pytest.raises(StateError):
             store.save()
+
+
+def test_legacy_state_without_ntfy_migrates_without_losing_data(tmp_path):
+    from kronbot.state import empty_state
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.save()
+    legacy = empty_state()
+    del legacy["ntfy"]
+    legacy["blocked_until"] = {"my.itmo.ru": 12345}
+    legacy["session"] = {
+        "sub": "owner", "access_token": "access", "access_expires_at": 100,
+        "refresh_token": None, "refresh_expires_at": None,
+    }
+    raw = json.dumps(legacy).encode()
+    if os.name == "nt":
+        import base64
+        import win32crypt
+        blob = win32crypt.CryptProtectData(raw, "kronbot state", None, None, None, 1)
+        raw = json.dumps({"version": 1, "dpapi": base64.b64encode(blob).decode()}).encode()
+    (directory / "state.json").write_bytes(raw)
+    with StateStore(directory) as store:
+        assert store.data["ntfy"] is None
+        assert store.data["blocked_until"] == legacy["blocked_until"]
+        assert store.data["session"]["access_token"] == "access"
+        store.save()
+    with StateStore(directory) as store:
+        assert store.data["ntfy"] is None
+        assert store.data["session"]["sub"] == "owner"
+        assert store.data["blocked_until"] == legacy["blocked_until"]
+
+
+@pytest.mark.parametrize("settings", [
+    {},
+    {"url": "http://example.com/topic", "token": None, "last_error": None},
+    {"url": "https://user@example.com/topic", "token": None, "last_error": None},
+    {"url": "https://example.com/topic?secret=1", "token": None, "last_error": None},
+    {"url": "https://example.com/topic#secret", "token": None, "last_error": None},
+    {"url": "https://example.com/topic", "token": 1, "last_error": None},
+    {"url": "https://example.com/topic", "token": None, "last_error": False},
+    {"url": "https://example.com/topic", "token": None, "last_error": None, "extra": 1},
+])
+def test_invalid_ntfy_state_is_rejected(tmp_path, settings):
+    with StateStore(tmp_path / "state") as store:
+        store.data["ntfy"] = settings
+        with pytest.raises(StateError):
+            store.save()

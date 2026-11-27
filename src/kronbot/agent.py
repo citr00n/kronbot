@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from .auth import AuthError, LoginRequired
 from .sport import Booking, HttpUnauthorized, SportError, forecast_identity
 from .state import StateError
+from . import notifications
 
 MSK = timezone(timedelta(hours=3))
 
@@ -50,6 +51,7 @@ class Agent:
         self.booking_enabled = True
         self.cancel_enabled = True
         self.lock = asyncio.Lock()
+        self._cycle_lock = asyncio.Lock()
         self.cancelling_ids = set()
         self.confirmed_ids: set[int] = set()
 
@@ -223,6 +225,9 @@ class Agent:
             queue[:] = original
             raise
         self.confirmed_ids.update(item["lesson_id"] for item in confirmed)
+        self._notification_events.extend(
+            "kronbot: запись на занятие подтверждена." for _ in confirmed
+        )
 
     async def bookings(self) -> list[Booking]:
         async with self.lock:
@@ -344,6 +349,36 @@ class Agent:
                 self.cancelling_ids = set()
 
     async def check(self, *, allow_booking: bool, only_lesson_id: int | None = None):
+        async with self._cycle_lock:
+            await self._check_with_notifications(
+                allow_booking=allow_booking, only_lesson_id=only_lesson_id
+            )
+
+    async def _check_with_notifications(self, *, allow_booking, only_lesson_id):
+        # Доставка только после завершения всех решений и POST текущего цикла.
+        self._notification_events = []
+        self._cycle_error = None
+        state_failed = False
+        try:
+            await self._check(allow_booking=allow_booking, only_lesson_id=only_lesson_id)
+        except (SportError, AuthError) as exc:
+            self._cycle_error = type(exc).__name__
+            raise
+        except StateError:
+            state_failed = True
+            raise
+        finally:
+            try:
+                for message in self._notification_events:
+                    await notifications.send(self.store, message)
+                # При сбое сохранения нельзя случайно сохранить незавершённое
+                # состояние очереди вместе с настройкой дедупликации.
+                if not state_failed:
+                    await notifications.error(self.store, self._cycle_error)
+            except Exception:
+                pass
+
+    async def _check(self, *, allow_booking: bool, only_lesson_id: int | None = None):
         async with self.lock:
             self.confirmed_ids = set()
             session = self.store.data["session"]
@@ -388,13 +423,20 @@ class Agent:
                 and lesson.signed
             }
             self._confirm(queue, signed_ids)
+            missed_forecasts = []
             for item in queue:
                 if (
                     item["status"] == "waiting"
                     and datetime.fromisoformat(item["starts_at"]).timestamp() <= now
                 ):
                     item["status"] = "expired"
+                    if _unbound_forecast(item):
+                        missed_forecasts.append(item)
             self.store.save()
+            self._notification_events.extend(
+                "kronbot: прогноз занятия не подтвердился к началу занятия."
+                for _ in missed_forecasts
+            )
             candidates = []
             for item in queue:
                 lesson = by_id.get(item["lesson_id"])
@@ -446,6 +488,7 @@ class Agent:
                 try:
                     result = await self.sport.enroll(lesson.id, item, before_post=permitted)
                 except HttpUnauthorized:
+                    self._cycle_error = "unauthorized"
                     item["status"] = "waiting"
                     try:
                         self.store.save()
@@ -469,5 +512,7 @@ class Agent:
                     except StateError:
                         item["status"], item["refusal_code"] = "uncertain", None
                         raise
+                    if result.status in {"uncertain", "rejected"}:
+                        self._cycle_error = result.status
                 if only_lesson_id is not None or result.status == "uncertain":
                     return
