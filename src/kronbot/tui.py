@@ -322,6 +322,7 @@ class KronbotApp(App):
         )
         queue = self.agent.queue() if session else []
         table = self.query_one("#schedule", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
         selected = self.hidden_schedule_selection or self._selected(table) or self.schedule_selection
         table.clear()
         visible = [lesson for lesson in self.agent.snapshot if self._matches_filters(lesson)]
@@ -353,8 +354,10 @@ class KronbotApp(App):
                 Text(""),
             )
         self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
         self.schedule_selection = selected
         table = self.query_one("#queue", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
         selected = self._selected(table)
         table.clear()
         for item in queue:
@@ -377,7 +380,9 @@ class KronbotApp(App):
         if not queue:
             table.add_row(Text(""), Text("Очередь пуста"), Text(""), Text(""))
         self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
         table = self.query_one("#bookings", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
         selected = self._selected(table)
         table.clear()
         for booking in self.bookings_snapshot:
@@ -391,6 +396,7 @@ class KronbotApp(App):
         if not self.bookings_snapshot:
             table.add_row(Text(""), Text("Нет активных записей"), Text(""), Text(""))
         self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
 
     def _matches_filters(self, lesson):
         search = self.query_one("#filter-search", Input).value.strip().casefold()
@@ -518,7 +524,7 @@ class KronbotApp(App):
     def _restore(table, key):
         if key:
             try:
-                table.move_cursor(row=table.get_row_index(key))
+                table.move_cursor(row=table.get_row_index(key), scroll=False)
             except Exception:
                 pass
 
@@ -556,7 +562,7 @@ class KronbotApp(App):
                 and not self.store.data["background_paused"]
             )
             self.agent.booking_enabled = self.auto
-        if self.is_mounted:
+        if self.is_mounted and previous != active:
             self._render()
 
     def _start_service_probe(self):

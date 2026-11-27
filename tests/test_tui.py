@@ -696,3 +696,45 @@ async def test_running_service_respects_persisted_pause_on_open(tmp_path):
             assert "на паузе" in str(app.query_one("#error", Static).render())
             assert all(not call.kwargs["allow_booking"] for call in app.agent.check.await_args_list)
         await app.sport.close()
+
+
+async def test_schedule_scroll_survives_service_probe_and_refresh(tmp_path):
+    from unittest.mock import AsyncMock
+    from kronbot.sport import Lesson
+
+    now = 1900000000
+    starts = datetime.fromtimestamp(now + 86400, timezone.utc)
+    lessons = [
+        Lesson(i, f"Секция {i}", "Зал", starts, 1, 2, 1, False, False, True)
+        for i in range(1, 41)
+    ]
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now, service_active=True, service_probe=lambda: True)
+
+        async def refresh(*, allow_booking):
+            app.agent.snapshot = lessons
+
+        app.agent.check = AsyncMock(side_effect=refresh)
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#schedule", DataTable)
+            table.focus()
+            await pilot.press(*(["down"] * 25))
+            await pilot.pause()
+            selected = app._selected(table)
+            assert selected == "26"
+            table.scroll_to(y=12, animate=False, immediate=True)
+            await pilot.pause()
+            position = table.scroll_y
+            assert position > 0
+            await app._probe_service()
+            await pilot.pause()
+            assert table.scroll_y == position
+            assert app._selected(table) == selected
+            app._render()
+            await pilot.pause()
+            assert table.scroll_y == position
+            assert app._selected(table) == selected
+        await app.sport.close()
