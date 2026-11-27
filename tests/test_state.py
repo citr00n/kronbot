@@ -99,7 +99,6 @@ def test_invalid_stored_isu_is_rejected(tmp_path, isu):
     ("prototype_lesson_id", 0),
     ("section_id", None),
     ("teacher_isu", True),
-    ("room_id", 0),
     ("type_id", 5),
     ("bound", "yes"),
     ("predicted_ends_at", "2030-01-15T11:31:00+03:00"),
@@ -133,6 +132,8 @@ def test_legacy_state_without_ntfy_migrates_without_losing_data(tmp_path):
         store.save()
     legacy = empty_state()
     del legacy["ntfy"]
+    del legacy["forecast_reports"]
+    del legacy["opening_window"]
     legacy["blocked_until"] = {"my.itmo.ru": 12345}
     legacy["session"] = {
         "sub": "owner", "access_token": "access", "access_expires_at": 100,
@@ -147,6 +148,8 @@ def test_legacy_state_without_ntfy_migrates_without_losing_data(tmp_path):
     (directory / "state.json").write_bytes(raw)
     with StateStore(directory) as store:
         assert store.data["ntfy"] is None
+        assert store.data["forecast_reports"] == {}
+        assert store.data["opening_window"] is None
         assert store.data["blocked_until"] == legacy["blocked_until"]
         assert store.data["session"]["access_token"] == "access"
         store.save()
@@ -169,5 +172,18 @@ def test_legacy_state_without_ntfy_migrates_without_losing_data(tmp_path):
 def test_invalid_ntfy_state_is_rejected(tmp_path, settings):
     with StateStore(tmp_path / "state") as store:
         store.data["ntfy"] = settings
+        with pytest.raises(StateError):
+            store.save()
+
+
+@pytest.mark.parametrize("window", [
+    {}, {"day": "2030-2-01", "until": 123},
+    {"day": "2030-02-30", "until": 123},
+    {"day": "2030-02-01", "until": True},
+    {"day": "2030-02-01", "until": 123, "extra": 1},
+])
+def test_invalid_opening_window_is_rejected(tmp_path, window):
+    with StateStore(tmp_path / "state") as store:
+        store.data["opening_window"] = window
         with pytest.raises(StateError):
             store.save()

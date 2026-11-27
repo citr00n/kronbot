@@ -4,11 +4,11 @@ import asyncio
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from .agent import MSK, Agent, auto_delay, opening_wait
+from .agent import MSK, Agent, auto_delay, opening_wait, opening_window
 from .auth import AuthError, LoginRequired, Restricted
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError
 from .state import StateError, StateLocked, StateStore
@@ -28,6 +28,12 @@ class BackgroundRunner:
         self.active_client = None
         self.active_agent = None
         self.next_check = 0.0
+        self.last_finished = None
+        self.last_finished_wall = None
+        self.scheduled_forced = None
+        self.scheduled_opening = False
+        self.scheduled_window_day = None
+        self.local_limit_until = None
         self.seen_uncertain: set[tuple[str, int]] = set()
 
     def stop(self):
@@ -41,10 +47,12 @@ class BackgroundRunner:
         """Вернуть задержку до следующей локальной проверки, не удерживая lock."""
         if self.cancel.is_set():
             return 0
-        if self.monotonic() < self.next_check:
-            return min(5.0, self.next_check - self.monotonic())
+        # Read the setting even while waiting: a user can change it under the
+        # short-lived lock while a local budget delay is in progress.
         try:
             with StateStore(self.directory) as store:
+                now = self.now()
+                forced = store.data["force_limits"]
                 session = store.data["session"]
                 if store.data["background_paused"] or session is None:
                     return 5.0
@@ -59,14 +67,57 @@ class BackgroundRunner:
                              and (sub, item["lesson_id"]) not in self.seen_uncertain]
                 if not waiting and not uncertain:
                     return 5.0
-                if waiting and self.next_check == 0:
-                    delay = opening_wait(self.now())
+                blocked_until = max(store.data["blocked_until"].values(), default=0)
+                if blocked_until > now:
+                    store.data["background_paused"] = True
+                    store.save()
+                    print(f"Фоновая запись приостановлена: {NetworkBlocked(blocked_until)}",
+                          file=sys.stderr, flush=True)
+                    return 5.0
+                if waiting and self.next_check == 0 and not forced:
+                    delay = opening_wait(now)
                     if delay:
                         return min(5.0, delay)
+                previous_window = store.data["opening_window"]
+                opening = opening_window(store, now) if waiting else False
+                window = store.data["opening_window"]
+                new_window = opening and window != previous_window
+                window_day = window["day"] if opening else None
+                rapid = forced or opening
+                if self.last_finished is not None and (
+                    forced != self.scheduled_forced
+                    or opening != self.scheduled_opening
+                    or (opening and window_day != self.scheduled_window_day)
+                ):
+                    if new_window or (opening and window_day != self.scheduled_window_day):
+                        # A new Moscow day supersedes even a pending local-budget delay.
+                        self.next_check = self.monotonic()
+                    else:
+                        minimum = 10.0 if rapid else 120.0
+                        if not rapid and self.local_limit_until is not None:
+                            minimum = max(minimum, self.local_limit_until - self.last_finished_wall)
+                        interval = auto_delay(self.last_finished_wall, minimum, forced=rapid)
+                        self.next_check = self.last_finished + interval
+                    self.scheduled_forced = forced
+                    self.scheduled_opening = opening
+                    self.scheduled_window_day = window_day
+                remaining = self.next_check - self.monotonic()
+                if remaining > 0:
+                    # Wake at midnight even if a normal or local-limit delay extends
+                    # beyond it. The lock is released before sleeping.
+                    local = datetime.fromtimestamp(now, MSK)
+                    midnight = datetime.combine(local.date() + timedelta(days=1),
+                                                datetime.min.time(), MSK).timestamp()
+                    if waiting:
+                        remaining = min(remaining, midnight - now)
+                    return min(5.0, remaining)
+                if self.cancel.is_set():
+                    return 0
                 client = self.client_factory(store, now=self.now)
+                client.opening_window_active = opening
                 agent = Agent(store, client, now=self.now, monotonic=self.monotonic)
                 self.active_client, self.active_agent = client, agent
-                delay = 120.0
+                delay = 10.0 if rapid else 120.0
                 try:
                     await agent.check(allow_booking=True)
                 except StateError:
@@ -94,6 +145,7 @@ class BackgroundRunner:
                     store.save()
                     print(f"Фоновая запись приостановлена: {exc}", file=sys.stderr, flush=True)
                 except LocalLimit as exc:
+                    self.local_limit_until = exc.until
                     delay = max(delay, exc.until - self.now())
                     print(str(exc), file=sys.stderr, flush=True)
                 except LoginRequired:
@@ -104,8 +156,13 @@ class BackgroundRunner:
                 finally:
                     self.seen_uncertain.update((sub, item["lesson_id"]) for item in queue if item["status"] == "uncertain")
                     await client.close()
-                    delay = auto_delay(self.now(), delay)
-                    self.next_check = self.monotonic() + delay
+                    self.last_finished_wall = self.now()
+                    self.last_finished = self.monotonic()
+                    self.scheduled_forced = forced
+                    self.scheduled_opening = opening
+                    self.scheduled_window_day = window_day
+                    delay = auto_delay(self.last_finished_wall, delay, forced=rapid)
+                    self.next_check = self.last_finished + delay
                     self.active_agent = None
                     self.active_client = None
                 return min(5.0, delay)

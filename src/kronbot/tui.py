@@ -14,7 +14,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Select, Static, TabbedContent, TabPane
 
-from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
+from .agent import MSK, Agent, QueueError, auto_delay, opening_wait, opening_window
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .login_guides import LOGIN_GUIDE
@@ -24,6 +24,15 @@ from .state import StateError, StateLocked, StateStore
 from .updates import check_update
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
+
+FORECAST_STATUSES = {
+    "not_checked": "Ещё не проверен",
+    "not_open": "Запись ещё не открыта",
+    "no_match": "Занятие не найдено",
+    "ambiguous": "Несколько совпадений; выбор невозможен",
+    "incomplete": "Недостаточно данных для сопоставления",
+    "matched": "Занятие найдено",
+}
 
 
 
@@ -44,6 +53,26 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "yes")
     def action_reject(self):
         self.dismiss(False)
+
+class ForceLimitsScreen(ConfirmScreen):
+    def __init__(self):
+        super().__init__(
+            "ВНИМАНИЕ: повышенная частота запросов может привести к ограничению доступа "
+            "или другим последствиям для аккаунта. Локальный лимит 60 спортивных запросов "
+            "в час отключается, повторная автоматическая проверка — каждые 10 секунд вместо 120. "
+            "Настройка также действует на фоновую службу. Серверные блокировки 403/429, "
+            "авторизация, проверка попыток и защита неопределённого исхода остаются обязательными. "
+            "Включить принудительный режим?"
+        )
+
+    def compose(self):
+        with Vertical(classes="dialog force-dialog"):
+            yield Static(self.message, id="force-disclaimer", markup=False)
+            with Horizontal():
+                yield Button("Да", id="yes", variant="error")
+                yield Button("Нет", id="no", variant="primary")
+
+
 
 
 
@@ -222,6 +251,10 @@ class KronbotApp(App):
     ModalScreen { align: center middle; }
     .dialog Horizontal { height: auto; align: center middle; }
     .dialog Button { margin: 0 1; }
+    .force-dialog { border: solid red; }
+    #force-disclaimer, #force-warning { color: red; text-style: bold; }
+    #force-warning { height: 1; }
+    #opening-warning { color: red; text-style: bold; height: 1; }
     #status { height: 3; }
     #update-notice, #login-update { height: auto; }
     #error { height: 2; }
@@ -297,11 +330,18 @@ class KronbotApp(App):
         today = datetime.fromtimestamp(now(), MSK).date()
         self.calendar_month = today.replace(day=1)
         self.calendar_days = []
+        self.opening_active = False
         self.stopping = False
 
     def compose(self):
         yield Header()
         yield Static("", id="status", markup=False)
+        force_warning = Static("ВНИМАНИЕ: локальные лимиты отключены; автоинтервал 10 с", id="force-warning", markup=False)
+        force_warning.display = False
+        yield force_warning
+        opening_warning = Static("ОКНО ОТКРЫТИЯ: опрос каждые 10 с; лимит 60 запросов/час отключён", id="opening-warning", markup=False)
+        opening_warning.display = False
+        yield opening_warning
         yield Static("", id="error", markup=False)
         update_notice = Static("", id="update-notice", markup=False)
         update_notice.display = False
@@ -337,6 +377,8 @@ class KronbotApp(App):
                 yield DataTable(id="calendar", cursor_type="cell")
             with TabPane("Очередь", id="queue-tab"):
                 yield DataTable(id="queue", cursor_type="row")
+            with TabPane("Прогнозы", id="forecasts-tab"):
+                yield DataTable(id="forecasts", cursor_type="row")
             with TabPane("Записи", id="bookings-tab"):
                 yield DataTable(id="bookings", cursor_type="row")
             with TabPane("Аккаунт", id="account-tab"):
@@ -345,12 +387,14 @@ class KronbotApp(App):
                     yield Button("Вход", id="account-login")
                     yield Button("Забыть вход", id="account-logout")
                     yield Button("ntfy", id="account-ntfy")
+                yield Button("Включить форсирование", id="account-force")
         yield Footer()
 
     def on_mount(self):
         self.query_one("#schedule", DataTable).add_columns("ID", "МСК", "Секция", "Зал", "Места", "Доступность", "Очередь")
         self.query_one("#calendar", DataTable).add_columns("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
         self.query_one("#queue", DataTable).add_columns("ID", "МСК", "Секция", "Статус")
+        self.query_one("#forecasts", DataTable).add_columns("Прототип", "Начало (МСК)", "Статус / причина", "Реальный ID", "Проверено (МСК)", "Отличия")
         self.query_one("#bookings", DataTable).add_columns("ID", "МСК", "Секция", "Зал")
         self._render()
         self.update_task = asyncio.create_task(self._check_update())
@@ -401,13 +445,18 @@ class KronbotApp(App):
         self.query_one("#status", Static).update(
             f"ИТМО: {'вход выполнен' if session else 'нужен вход'}{expiry}\nАвтозапись: {'включена' if self.auto else 'на паузе'}{' (служба)' if self.service_active else ' (только TUI)'} | Последняя проверка: {checked}"
         )
+        forced = self.store.data["force_limits"]
+        self.query_one("#force-warning", Static).display = forced
+        self.query_one("#opening-warning", Static).display = self.auto and self.opening_active
+        self.query_one("#account-force", Button).label = "Отключить форсирование" if forced else "Включить форсирование"
         isu = clean_text(str(session.get("isu") or "")) if session else ""
         self.query_one("#account", Static).update(
             f"Состояние: {'вход выполнен' if session else 'нужен вход'}\n"
             f"Номер ИСУ: {isu or 'не указан'}\n"
             f"Срок сессии (МСК):{expiry or ' не указан'}\n"
             f"Автозапись: {'включена' if self.auto else 'на паузе'}\n"
-            f"Уведомления ntfy: {'включены' if self.store.data['ntfy'] else 'отключены'}"
+            f"Уведомления ntfy: {'включены' if self.store.data['ntfy'] else 'отключены'}\n"
+            f"Форсирование локальных лимитов: {'включено' if forced else 'выключено'}"
         )
         stale = (
             self.bookings_stale
@@ -494,6 +543,26 @@ class KronbotApp(App):
             )
         if not queue:
             table.add_row(Text(""), Text("Очередь пуста"), Text(""), Text(""))
+        self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
+        table = self.query_one("#forecasts", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
+        selected = self._selected(table)
+        table.clear()
+        diagnostics = self.agent.forecast_diagnostics() if session else []
+        for report in diagnostics:
+            checked_at = report["checked_at"]
+            table.add_row(
+                Text(str(report["prototype_id"])),
+                Text(datetime.fromisoformat(report["starts_at"]).astimezone(MSK).strftime("%d.%m.%Y %H:%M")),
+                Text(FORECAST_STATUSES.get(report["status"], clean_text(report["status"]))),
+                Text(str(report["real_id"]) if report["real_id"] is not None else "—"),
+                Text(datetime.fromtimestamp(checked_at, MSK).strftime("%d.%m.%Y %H:%M") if checked_at is not None else "—"),
+                Text("; ".join(clean_text(item) for item in report["differences"]) if report["status"] == "matched" and report["differences"] else "—"),
+                key=f"{report['prototype_id']}:{report['starts_at']}",
+            )
+        if not diagnostics:
+            table.add_row(Text(""), Text("Нет прогнозов"), Text(""), Text(""), Text(""), Text(""))
         self._restore(table, selected)
         table.call_after_refresh(table.scroll_to, *scroll, animate=False)
         table = self.query_one("#bookings", DataTable)
@@ -637,6 +706,32 @@ class KronbotApp(App):
             self.action_logout()
         elif event.button.id == "account-ntfy":
             self.push_screen(NtfyScreen(), lambda _: self._render())
+        elif event.button.id == "account-force":
+            if self.store.data["force_limits"]:
+                self._set_force_limits(False)
+            else:
+                self.push_screen(ForceLimitsScreen(), self._confirm_force_limits)
+
+    def _confirm_force_limits(self, confirmed):
+        if confirmed:
+            self._set_force_limits(True)
+
+    def _set_force_limits(self, enabled):
+        old = self.store.data["force_limits"]
+        self.store.data["force_limits"] = enabled
+        try:
+            self.store.save()
+        except StateError:
+            self.store.data["force_limits"] = old
+            self.error = "Не удалось сохранить настройку форсирования."
+        else:
+            self.auto_interval = auto_delay(self.now(), 10, forced=True) if enabled else auto_delay(self.now())
+            if enabled:
+                # This deadline is set only by LocalLimit; server blocks live in state.
+                self.limit_until = 0
+            if max(self.store.data["blocked_until"].values(), default=0) <= self.now():
+                self.error = ""
+        self._render()
 
     def action_search(self):
         if self.query_one(TabbedContent).active == "schedule-tab":
@@ -778,6 +873,7 @@ class KronbotApp(App):
                 await self._start_service_probe()
                 if not self.auto or self.stopping:
                     return
+            self.sport.opening_window_active = bool(auto and opening_window(self.store, self.now()))
             if not bookings_only:
                 await self.agent.check(allow_booking=auto)
                 self.stale = False
@@ -797,6 +893,7 @@ class KronbotApp(App):
             if isinstance(exc, (Restricted, LoginRequired, NetworkBlocked)):
                 self._stop_for_error(exc)
         finally:
+            self.sport.opening_window_active = False
             if not auto and not self.stopping and self.store.data["session"]:
                 try:
                     await self._refresh_sport_types()
@@ -818,7 +915,11 @@ class KronbotApp(App):
                         self._stop_for_error(exc)
                         self.error = str(exc)
             if auto:
-                self.auto_interval = auto_delay(self.now())
+                self.auto_interval = (
+                    10.0 if self.opening_active else
+                    auto_delay(self.now(), 10, forced=True)
+                    if self.store.data["force_limits"] else auto_delay(self.now())
+                )
                 self.last_auto = self.monotonic()
                 if self.store.data["session"]:
                     owner = self.store.data["session"]["sub"]
@@ -852,7 +953,17 @@ class KronbotApp(App):
             or not self.store.data["session"]
         ):
             return
-        if self.now() < self.limit_until:
+        try:
+            active = opening_window(self.store, self.now())
+        except StateError as exc:
+            self.opening_active = False
+            self.error = str(exc)
+            self._render()
+            return
+        if active != self.opening_active:
+            self.opening_active = active
+            self._render()
+        if not active and self.now() < self.limit_until:
             return
         queue = self.agent.queue()
         owner = self.store.data["session"]["sub"]
@@ -862,9 +973,12 @@ class KronbotApp(App):
             for x in queue
         ):
             return
-        if self.last_auto is None and any(x["status"] == "waiting" for x in queue) and opening_wait(self.now()):
+        if not active and not self.store.data["force_limits"] and self.last_auto is None and any(x["status"] == "waiting" for x in queue) and opening_wait(self.now()):
             return
-        if self.last_auto is None or self.monotonic() - self.last_auto >= self.auto_interval:
+        interval = 10.0 if active else self.auto_interval
+        if not active and not self.store.data["force_limits"]:
+            interval = max(120.0, interval)
+        if self.last_auto is None or self.monotonic() - self.last_auto >= interval:
             self._start(True)
 
     def action_refresh(self):

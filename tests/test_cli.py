@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -301,6 +301,7 @@ async def test_queue_forecast_and_disambiguated_removal(tmp_path, capsys):
         target = {
             **lesson,
             "id": 11,
+            "type_id": 6,
             "date": (start + timedelta(days=14)).isoformat(),
             "date_end": (start + timedelta(days=14, hours=1)).isoformat(),
         }
@@ -326,8 +327,118 @@ async def test_queue_forecast_and_disambiguated_removal(tmp_path, capsys):
         assert await run("queue", "remove", "10", "--forecast") == 0
         assert not queue
         lesson.pop("teacher_isu")
-        with pytest.raises(QueueError, match="нельзя создать"):
-            await run("queue", "forecast", "10")
+        assert await run("queue", "forecast", "10") == 0
+        assert queue[0]["forecast"]["teacher_isu"] is None
+        await client.close()
+
+
+@pytest.mark.parametrize(("status", "message"), [
+    ("not_checked", "Ещё не проверен"),
+    ("not_open", "Запись ещё не открыта"),
+    ("no_match", "Подходящее занятие не найдено"),
+    ("ambiguous", "сопоставление неоднозначно"),
+    ("incomplete", "Недостаточно данных"),
+    ("matched", "Занятие сопоставлено"),
+])
+async def test_queue_diagnose_local_reports(monkeypatch, tmp_path, capsys, status, message):
+    from kronbot import cli
+
+    now = 1900000000
+    reports = [{
+        "prototype_id": 10, "starts_at": "2030-12-11T05:10:00+00:00",
+        "status": status, "checked_at": None if status == "not_checked" else now,
+        "real_id": 11 if status == "matched" else None,
+        "differences": ["Зал изменился", "Преподаватель изменился"],
+    }]
+    monkeypatch.setattr(cli.Agent, "forecast_diagnostics", lambda self: reports)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        def no_network(request):
+            pytest.fail("Диагностика не должна обращаться к сети")
+        client = SportClient(store, transport=httpx.MockTransport(no_network), now=lambda: now)
+        assert await execute(parser().parse_args(["queue", "diagnose", "10"]), store, client, now=lambda: now) == 0
+        output = capsys.readouterr().out
+        assert "Прототип: 10" in output and "11.12.2030 08:10 МСК" in output
+        assert message in output and "kronbot schedule" in output
+        if status == "not_checked":
+            assert "ещё не проверялся" in output
+        else:
+            assert datetime.fromtimestamp(now, timezone(timedelta(hours=3))).strftime(
+                "%d.%m.%Y %H:%M:%S МСК"
+            ) in output
+        if status == "matched":
+            assert "ID реального занятия: 11" in output
+            assert "Отличие: Зал изменился" in output and "Преподаватель изменился" in output
+        else:
+            assert "ID реального занятия: не определён" in output
+            assert "Отличие:" not in output
+        await client.close()
+
+
+async def test_queue_diagnose_empty_and_missing_id(monkeypatch, tmp_path, capsys):
+    from kronbot import cli
+    from kronbot.agent import QueueError
+
+    monkeypatch.setattr(cli.Agent, "forecast_diagnostics", lambda self: [])
+    now = 1900000000
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        client = SportClient(store, transport=httpx.MockTransport(lambda request: pytest.fail("network")), now=lambda: now)
+        assert await execute(parser().parse_args(["queue", "diagnose"]), store, client, now=lambda: now) == 0
+        assert "Нет прогнозов" in capsys.readouterr().out
+        with pytest.raises(QueueError, match="не найден"):
+            await execute(parser().parse_args(["queue", "diagnose", "10"]), store, client, now=lambda: now)
+        await client.close()
+
+
+async def test_queue_diagnose_survives_booking_and_restart(tmp_path, capsys):
+    from kronbot.agent import Agent
+
+    now = [1900000000]
+    start = datetime.fromtimestamp(now[0] + 86400, timezone.utc)
+    prototype = {
+        "id": 10, "date": start.isoformat(),
+        "date_end": (start + timedelta(hours=1)).isoformat(),
+        "section_name": "Бег", "room_name": "Зал", "section_level": 1,
+        "type_id": 2, "available": 1, "signed": False,
+        "can_sign_in": {"can_sign_in": True}, "section_id": 1,
+        "lesson_level": 1, "building_id": 2, "room_id": 3,
+        "time_slot_id": 4, "teacher_isu": 5,
+    }
+    lessons = [prototype]
+    requests = []
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"error_code": 0, "result": [11]})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": lessons}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0, "result": {"free_attempts": 1, "can_sign_in": True}})
+    path = tmp_path / "state"
+    with StateStore(path) as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now[0] + 30 * 86400, "refresh_token": None, "refresh_expires_at": None}
+        client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now[0])
+        assert await execute(parser().parse_args(["queue", "forecast", "10"]), store, client, now=lambda: now[0]) == 0
+        now[0] += 8 * 86400
+        lessons[:] = [{**prototype, "id": 11, "room_id": 8, "room_name": "Другой зал",
+                       "date": (start + timedelta(days=14)).isoformat(),
+                       "date_end": (start + timedelta(days=14, hours=1)).isoformat()}]
+        await Agent(store, client, now=lambda: now[0]).check(allow_booking=True)
+        assert not store.data["queues"]["owner"]
+        assert any(request.method == "POST" for request in requests)
+        await client.close()
+    capsys.readouterr()
+    with StateStore(path) as store:
+        client = SportClient(store, transport=httpx.MockTransport(lambda request: pytest.fail("network")), now=lambda: now[0])
+        assert await execute(parser().parse_args(["queue", "diagnose"]), store, client, now=lambda: now[0]) == 0
+        output = capsys.readouterr().out
+        assert "Прототип: 10" in output and "ID реального занятия: 11" in output
+        assert "Занятие сопоставлено" in output and "Отличие:" in output
+        store.data["session"]["sub"] = "other"
+        assert await execute(parser().parse_args(["queue", "diagnose"]), store, client, now=lambda: now[0]) == 0
+        assert "Нет прогнозов" in capsys.readouterr().out
         await client.close()
 
 
@@ -445,7 +556,9 @@ def test_update_check_only_interactive_cli(monkeypatch, capsys, argv, tty, expec
     monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
     monkeypatch.setattr(cli, "_service_notice", lambda *args, **kwargs: "")
     class Store:
-        data = {"background_paused": False}
+        data = {"background_paused": False, "force_limits": False}
+        def __init__(self, directory=None):
+            pass
         def __enter__(self):
             return self
         def __exit__(self, *args):
@@ -573,3 +686,181 @@ def test_ntfy_cli_never_accepts_secrets_as_arguments_or_pipe(tmp_path):
     assert result.returncode == 2
     assert "private-topic" not in result.stdout + result.stderr
     assert "synthetic-bearer" not in result.stdout + result.stderr
+
+
+def test_limits_cli_persists_without_login_or_network(tmp_path):
+    env = {**os.environ, "KRONBOT_STATE_DIR": str(tmp_path / "state")}
+    result = invoke("limits", "force", input="yes\n", env=env)
+    assert result.returncode == 2
+    assert "60" in result.stderr and "10 секунд" in result.stderr
+    assert "\x1b" not in result.stderr
+    assert "включён" not in result.stdout
+    result = invoke("limits", "force", "--confirm-risk", env=env)
+    assert result.returncode == 0
+    assert "403/429" in result.stderr and "\x1b" not in result.stderr
+    result = invoke("limits", "status", env=env)
+    assert result.returncode == 0 and "включён" in result.stdout
+    assert "60" in result.stderr
+    result = invoke("logout", env=env)
+    assert result.returncode == 0 and "60" in result.stderr
+    result = invoke("limits", "normal", env=env)
+    assert result.returncode == 0 and "60" in result.stderr
+    result = invoke("limits", "status", env=env)
+    assert result.returncode == 0 and "Обычные" in result.stdout
+    assert not result.stderr
+
+
+@pytest.mark.parametrize(("answer", "expected"), [("", False), ("n", False), ("да", True)])
+def test_limits_interactive_confirmation(monkeypatch, tmp_path, capsys, answer, expected):
+    from kronbot import cli
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: answer)
+    with StateStore(tmp_path / "state") as store:
+        assert cli._limits_command(parser().parse_args(["limits", "force"]), store) == 0
+        assert store.data["force_limits"] is expected
+    output = capsys.readouterr()
+    assert "\x1b[31m" in output.err and "10 секунд" in output.err
+    assert "Включить форсированный режим?" not in output.out
+
+
+@pytest.mark.parametrize(("action", "initial"), [("force", False), ("normal", True)])
+def test_limits_save_failure_restores_previous_value(monkeypatch, tmp_path, action, initial):
+    from kronbot import cli
+    from kronbot.state import StateError
+
+    with StateStore(tmp_path / "state") as store:
+        store.data["force_limits"] = initial
+        store.save()
+        def fail_save():
+            raise StateError("Ошибка сохранения")
+        monkeypatch.setattr(store, "save", fail_save)
+        argv = ["limits", action] + (["--confirm-risk"] if action == "force" else [])
+        with pytest.raises(StateError):
+            cli._limits_command(parser().parse_args(argv), store)
+        assert store.data["force_limits"] is initial
+    with StateStore(tmp_path / "state") as store:
+        assert store.data["force_limits"] is initial
+
+
+@pytest.mark.parametrize(("forced", "limited", "expected"), [
+    (False, False, 120.0), (True, False, 10.0), (True, True, 300.0),
+])
+async def test_watch_uses_selected_interval(monkeypatch, tmp_path, forced, limited, expected):
+    from kronbot import cli
+    from kronbot.sport import LocalLimit
+    from types import SimpleNamespace
+
+    calls = []
+    cancel = asyncio.Event()
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            self.confirmed_ids = set()
+
+        def queue(self):
+            return [{"lesson_id": 1, "status": "waiting"}]
+
+        async def check(self, **kwargs):
+            if limited:
+                raise LocalLimit(1900000300)
+
+    async def wait_for(awaitable, timeout):
+        awaitable.close()
+        calls.append(("wait", timeout))
+        cancel.set()
+
+    monkeypatch.setattr(cli, "Agent", FakeAgent)
+    monkeypatch.setattr(cli, "opening_window", lambda store, now: False)
+    monkeypatch.setattr(cli.asyncio, "wait_for", wait_for)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access",
+                                 "access_expires_at": 2000000000, "refresh_token": None,
+                                 "refresh_expires_at": None}
+        store.data["force_limits"] = forced
+        sport = SimpleNamespace(opening_window_active=False)
+        assert await execute(parser().parse_args(["watch"]), store, sport, cancel=cancel,
+                             now=lambda: 1900000000) == 0
+    assert calls == [("wait", expected)]
+    assert not sport.opening_window_active
+
+
+@pytest.mark.parametrize("start_before_midnight", [True, False])
+async def test_watch_opening_window_and_midnight_wakeup(monkeypatch, tmp_path, capsys, start_before_midnight):
+    from types import SimpleNamespace
+    from kronbot import cli
+
+    midnight = datetime(2030, 12, 11, tzinfo=timezone(timedelta(hours=3))).timestamp()
+    clock = [midnight - 60 if start_before_midnight else midnight + 3600]
+    cancel = asyncio.Event()
+    cycles, waits = [], []
+    sport = SimpleNamespace(opening_window_active=False)
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            self.confirmed_ids = set()
+        def queue(self):
+            return [{"lesson_id": 1, "status": "waiting"}]
+        async def check(self, **kwargs):
+            cycles.append((clock[0], sport.opening_window_active))
+            if len(cycles) == 3:
+                cancel.set()
+    async def wait_for(awaitable, timeout):
+        awaitable.close()
+        waits.append(timeout)
+        clock[0] += timeout
+    def window(store, now):
+        return now >= midnight
+    monkeypatch.setattr(cli, "Agent", FakeAgent)
+    monkeypatch.setattr(cli, "opening_window", window)
+    monkeypatch.setattr(cli.asyncio, "wait_for", wait_for)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access",
+                                 "access_expires_at": midnight + 10000, "refresh_token": None,
+                                 "refresh_expires_at": None}
+        assert await execute(parser().parse_args(["watch"]), store, sport, cancel=cancel,
+                             now=lambda: clock[0]) == 0
+    if start_before_midnight:
+        assert cycles == [(midnight - 60, False), (midnight, True), (midnight + 10, True)]
+        assert waits == [60, 10]
+    else:
+        assert [active for _, active in cycles] == [True, True, True]
+        assert waits == [10, 10]
+    assert not sport.opening_window_active
+    assert capsys.readouterr().err.count("локальный лимит") == 1
+
+
+async def test_watch_opening_window_expires_and_is_not_reopened(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from kronbot import cli
+
+    clock = [1900000000]
+    cancel = asyncio.Event()
+    sport = SimpleNamespace(opening_window_active=False)
+    cycles, waits = [], []
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            self.confirmed_ids = set()
+        def queue(self):
+            return store.data["queues"]["owner"]
+        async def check(self, **kwargs):
+            cycles.append(sport.opening_window_active)
+            if len(cycles) == 32:
+                cancel.set()
+    async def wait_for(awaitable, timeout):
+        awaitable.close()
+        waits.append(timeout)
+        clock[0] += timeout
+    monkeypatch.setattr(cli, "Agent", FakeAgent)
+    monkeypatch.setattr(cli.asyncio, "wait_for", wait_for)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access",
+                                 "access_expires_at": 2000000000, "refresh_token": None,
+                                 "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "status": "waiting",
+                                          "section_name": "Бег", "starts_at": "2031-01-01T00:00:00+03:00",
+                                          "refusal_code": None}]
+        assert await execute(parser().parse_args(["watch"]), store, sport, cancel=cancel,
+                             now=lambda: clock[0]) == 0
+    assert cycles == [True] * 30 + [False, False]
+    assert waits[:30] == [10] * 30
+    assert waits[30] == 120

@@ -20,10 +20,13 @@ class SportError(Exception):
 class LocalLimit(SportError):
     def __init__(self, until: int):
         self.until = until
-        super().__init__(f"Локальное ограничение до {datetime.fromtimestamp(until, timezone.utc).isoformat()}.")
+        super().__init__(f"Локальное ограничение до {datetime.fromtimestamp(until).astimezone().isoformat()}.")
 
 class NetworkBlocked(LocalLimit):
     """Действует сохранённый запрет после ответа сервера."""
+    def __init__(self, until: int):
+        self.until = until
+        SportError.__init__(self, f"Серверная блокировка до {datetime.fromtimestamp(until).astimezone().isoformat()}.")
 
 
 
@@ -61,33 +64,13 @@ class Lesson:
 
 
 def forecast_identity(lesson):
-    """Строгая идентичность повторяющегося занятия либо None."""
-    if (
-        lesson.type_id != 2
-        or not all(_positive_id(value) for value in (
-            lesson.section_id, lesson.teacher_isu, lesson.time_slot_id
-        ))
-        or type(lesson.section_level) is not int
-        or type(lesson.lesson_level) is not int
-        or not (
-            (_positive_id(lesson.building_id) and _positive_id(lesson.room_id))
-            or (lesson.room_id == -1 and lesson.building_id in (None, -1)
-                and type(lesson.room_id) is int
-                and (lesson.building_id is None or type(lesson.building_id) is int))
-        )
-        or not isinstance(lesson.starts_at, datetime)
-        or lesson.starts_at.utcoffset() is None
-        or not isinstance(lesson.ends_at, datetime)
-        or lesson.ends_at.utcoffset() is None
-        or lesson.ends_at <= lesson.starts_at
-    ):
+    """Ключ свободного посещения или занятия с нормативами."""
+    if (not _positive_id(lesson.section_id) or type(lesson.section_level) is not int
+            or lesson.section_level != 1 or type(lesson.type_id) is not int
+            or lesson.type_id not in (2, 6) or not isinstance(lesson.starts_at, datetime)
+            or lesson.starts_at.utcoffset() is None):
         return None
-    return (
-        lesson.section_id, lesson.teacher_isu,
-        None if lesson.room_id == -1 else lesson.building_id,
-        lesson.room_id, lesson.section_level, lesson.lesson_level,
-        lesson.type_id, lesson.time_slot_id, lesson.starts_at, lesson.ends_at,
-    )
+    return (lesson.section_id, lesson.section_level, 2, lesson.starts_at)
 
 
 def forecast_prototypes(lessons, now):
@@ -99,10 +82,8 @@ def forecast_prototypes(lessons, now):
         identity = forecast_identity(lesson)
         if identity is None or lesson.section_level != 1:
             continue
-        target = identity[:-2] + (
-            identity[-2] + timedelta(days=14), identity[-1] + timedelta(days=14)
-        )
-        if target[-2].timestamp() <= now or target in identities or target in targets:
+        target = identity[:-1] + (identity[-1] + timedelta(days=14),)
+        if target[-1].timestamp() <= now or target in identities or target in targets:
             continue
         targets.add(target)
         result.append(lesson)
@@ -161,9 +142,10 @@ def _lesson(raw):
                 or type(permitted) is not bool or starts.utcoffset() is None):
             return None
         section, room = raw.get("section_name", ""), raw.get("room_name", "")
+        section = section if isinstance(section, str) else ""
+        room = room if isinstance(room, str) else ""
         intersection = raw.get("intersection", False)
-        if not isinstance(section, str) or not isinstance(room, str) or type(intersection) is not bool:
-            return None
+        intersection = intersection if type(intersection) is bool else False
         try:
             ends_at = datetime.fromisoformat(raw["date_end"])
             if ends_at.utcoffset() is None or ends_at <= starts:
@@ -181,12 +163,12 @@ def _lesson(raw):
             signed,
             intersection,
             permitted,
-            section_id=raw.get("section_id"),
-            lesson_level=raw.get("lesson_level"),
-            building_id=raw.get("building_id", 0),
-            room_id=raw.get("room_id"),
-            time_slot_id=raw.get("time_slot_id"),
-            teacher_isu=raw.get("teacher_isu"),
+            section_id=raw.get("section_id") if _positive_id(raw.get("section_id")) else None,
+            lesson_level=raw.get("lesson_level") if type(raw.get("lesson_level")) is int else None,
+            building_id=raw.get("building_id") if type(raw.get("building_id")) is int else None,
+            room_id=raw.get("room_id") if type(raw.get("room_id")) is int else None,
+            time_slot_id=raw.get("time_slot_id") if _positive_id(raw.get("time_slot_id")) else None,
+            teacher_isu=raw.get("teacher_isu") if _positive_id(raw.get("teacher_isu")) else None,
             teacher_name=clean_text(raw["teacher_fio"]) if isinstance(raw.get("teacher_fio"), str) else "",
             ends_at=ends_at,
         )
@@ -203,8 +185,8 @@ class SportClient:
         self.pending_session = None
         self.stopped = False
         self.in_flight = None
-        self.forecast_ambiguous_times: set[datetime] = set()
-        self.forecast_incomplete = False
+        self.forecast_invalid_rows = []
+        self.opening_window_active = False
 
     async def close(self):
         await self.client.aclose()
@@ -321,8 +303,8 @@ class SportClient:
         self.check_blocks()
         now = int(self.now())
         times = [t for t in self.store.data["sport_request_times"] if t > now - 3600]
-        if len(times) >= 60:
-            raise LocalLimit(min(times) + 3600)
+        if not (self.store.data["force_limits"] or self.opening_window_active) and len(times) >= 60:
+            raise LocalLimit(sorted(times)[len(times) - 60] + 3600)
         times.append(now)
         self.store.data["sport_request_times"] = times
         if enrollment is not None:
@@ -387,26 +369,25 @@ class SportClient:
         result = await self._request("GET", "sign/schedule", params=params)
         raw_lessons = list(_days(result))
         lessons = []
-        ambiguous_times = set()
-        incomplete = False
+        invalid = []
         for raw in raw_lessons:
             lesson = _lesson(raw)
             if lesson is not None:
                 lessons.append(lesson)
-                continue
-            try:
-                starts = datetime.fromisoformat(raw["date"])
-                if starts.utcoffset() is None:
-                    raise ValueError()
-                ambiguous_times.add(starts)
-            except (KeyError, TypeError, ValueError):
-                incomplete = True
+                if (lesson.section_level == 1 and lesson.type_id in (2, 6)
+                        and forecast_identity(lesson) is None):
+                    invalid.append(raw)
+            else:
+                invalid.append(raw)
         counts = {}
         for lesson in lessons:
             counts[lesson.id] = counts.get(lesson.id, 0) + 1
-        ambiguous_times.update(lesson.starts_at for lesson in lessons if counts[lesson.id] > 1)
-        self.forecast_ambiguous_times = ambiguous_times
-        self.forecast_incomplete = incomplete
+        # Keep the original key fields of invalid and duplicate rows. A row
+        # blocks only forecasts it could actually compete with.
+        invalid.extend(raw for raw in raw_lessons
+                       if isinstance(raw, dict) and _positive_id(raw.get("id"))
+                       and counts.get(raw["id"], 0) > 1)
+        self.forecast_invalid_rows = invalid
         return sorted((lesson for lesson in lessons if counts[lesson.id] == 1), key=lambda x: (x.starts_at, x.id))
 
     async def sport_types(self) -> list[tuple[int, str]]:

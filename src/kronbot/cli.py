@@ -15,8 +15,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .agent import Agent, MSK, QueueError
-from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
+from .agent import MSK, Agent, QueueError, opening_window
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .login_guides import LOGIN_GUIDE
@@ -26,7 +25,69 @@ from .state import StateError, StateLocked, StateStore, state_directory
 from .updates import check_update
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
+FORECAST_STATUSES = {
+    "not_checked": "Ещё не проверен",
+    "not_open": "Запись ещё не открыта",
+    "no_match": "Подходящее занятие не найдено",
+    "ambiguous": "Найдено несколько подходящих занятий; сопоставление неоднозначно",
+    "incomplete": "Недостаточно данных для сопоставления",
+    "matched": "Занятие сопоставлено",
+}
 SERVICE_PAUSED_NOTICE = "Фоновая автозапись на паузе. После окончания ограничений возобновите её клавишей p в TUI или командой kronbot service start."
+FORCE_WARNING = (
+    "ВНИМАНИЕ: форсированный режим отключает локальный лимит 60 запросов в час "
+    "и сокращает интервал фоновой проверки до 10 секунд. Это повышает нагрузку "
+    "и риск ограничений аккаунта. Серверные блокировки 403/429, авторизация, "
+    "проверка попыток и защита неопределённого исхода сохраняются. "
+    "Режим действует также на фоновую службу."
+)
+
+
+def _force_warning():
+    text = FORCE_WARNING
+    if sys.stderr.isatty():
+        text = f"\033[31m{text}\033[0m"
+    print(text, file=sys.stderr)
+
+
+def _limits_command(args, store):
+    if args.limits_command == "status":
+        print("Форсированный режим включён." if store.data["force_limits"] else
+              "Обычные локальные ограничения включены.")
+        return 0
+    forced = args.limits_command == "force"
+    if forced:
+        _force_warning()
+        if not args.confirm_risk:
+            if not sys.stdin.isatty() or not sys.stderr.isatty():
+                raise ValueError("Для подтверждения нужен терминал или флаг --confirm-risk.")
+            print("Включить форсированный режим? [y/N]: ", end="", file=sys.stderr, flush=True)
+            try:
+                answer = input().strip().lower()
+            except (EOFError, OSError):
+                raise ValueError("Подтверждение не получено.") from None
+            if answer not in ("y", "yes", "д", "да"):
+                print("Форсированный режим не включён.")
+                return 0
+    old = store.data["force_limits"]
+    store.data["force_limits"] = forced
+    try:
+        store.save()
+    except StateError:
+        store.data["force_limits"] = old
+        raise
+    print("Форсированный режим включён." if forced else "Обычные локальные ограничения включены.")
+    return 0
+
+
+def _warn_forced_state(directory=None):
+    try:
+        with StateStore(directory) as store:
+            if store.data["force_limits"]:
+                _force_warning()
+    except (StateLocked, StateError):
+        pass
+
 
 
 def positive_id(value):
@@ -64,6 +125,9 @@ def parser():
     queue = sub.add_parser("queue", help="Управлять локальной очередью")
     actions = queue.add_subparsers(dest="queue_command", required=True)
     actions.add_parser("list", help="Показать очередь")
+    diagnose = actions.add_parser("diagnose", help="Показать локальную диагностику прогнозов")
+    diagnose.add_argument("id", nargs="?", type=positive_id, metavar="ID",
+                          help="ID прототипа; без ID показываются все прогнозы")
     for action in ("add", "forecast", "remove", "retry"):
         command = actions.add_parser(
             action, help="Добавить прогноз на 14 суток вперёд" if action == "forecast" else None
@@ -79,6 +143,12 @@ def parser():
     book = sub.add_parser("book", help="Попробовать записаться один раз")
     book.add_argument("id", type=positive_id, metavar="ID")
     sub.add_parser("watch", help="Ожидать места в переднем плане")
+    limits = sub.add_parser("limits", help="Управлять локальными ограничениями")
+    limits_commands = limits.add_subparsers(dest="limits_command", required=True)
+    force = limits_commands.add_parser("force", help="Отключить локальные лимиты после подтверждения риска")
+    force.add_argument("--confirm-risk", action="store_true", help="Явно подтвердить риск без интерактивного вопроса")
+    limits_commands.add_parser("normal", help="Восстановить обычные локальные ограничения")
+    limits_commands.add_parser("status", help="Показать режим локальных ограничений")
     sub.add_parser("doctor", help="Проверить и восстановить фоновую службу")
     browser = sub.add_parser("browser", help="Установить Chromium для веб-входа")
     browser_commands = browser.add_subparsers(dest="browser_command", required=True)
@@ -302,6 +372,31 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
         for item in queue:
             print(_item_line(item))
         return 0
+    if command == "queue" and args.queue_command == "diagnose":
+        reports = agent.forecast_diagnostics()
+        if args.id is not None:
+            reports = [report for report in reports if report["prototype_id"] == args.id]
+            if not reports:
+                raise QueueError("Прогноз с этим ID прототипа не найден.")
+        if not reports:
+            print("Нет прогнозов для диагностики.")
+        for report in reports:
+            starts = datetime.fromisoformat(report["starts_at"]).astimezone(MSK)
+            checked = report["checked_at"]
+            checked_text = (
+                datetime.fromtimestamp(checked, MSK).strftime("%d.%m.%Y %H:%M:%S МСК")
+                if checked is not None else "ещё не проверялся"
+            )
+            real_id = report["real_id"]
+            print(f"Прототип: {report['prototype_id']}  Начало: {starts:%d.%m.%Y %H:%M} МСК")
+            print(f"  Статус: {FORECAST_STATUSES[report['status']]}")
+            print(f"  ID реального занятия: {real_id if real_id is not None else 'не определён'}")
+            print(f"  Последняя проверка: {checked_text}")
+            if report["status"] == "matched":
+                for difference in report["differences"]:
+                    print(f"  Отличие: {clean_text(difference)}")
+        print("Свежие данные появляются после фоновой проверки или команды kronbot schedule.")
+        return 0
     if command == "queue" and args.queue_command in ("remove", "retry"):
         if args.forecast is None and sum(item["lesson_id"] == args.id for item in agent.queue()) > 1:
             raise QueueError("Укажите --forecast для прогноза или --lesson для занятия.")
@@ -362,18 +457,22 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
     if command == "watch":
         print("Автозапись запущена. Остановка: Ctrl+C.")
         previous = {(x["lesson_id"], _unbound_forecast(x)): x["status"] for x in agent.queue()}
-        if any(status in ("waiting", "uncertain") for status in previous.values()):
-            wait_until_open = opening_wait(now())
-            if wait_until_open:
-                try:
-                    await asyncio.wait_for(cancel.wait(), timeout=wait_until_open)
-                except TimeoutError:
-                    pass
+        window_announced = False
         while not cancel.is_set():
             queue = agent.queue()
             if not any(x["status"] in ("waiting", "uncertain") for x in queue):
                 return 0
-            delay = 120.0
+            active = opening_window(store, now())
+            sport.opening_window_active = active
+            if active and not window_announced:
+                print(
+                    "Окно открытия: на 5 минут временно отключён локальный лимит "
+                    "60 запросов в час; серверные ограничения продолжают действовать.",
+                    file=sys.stderr,
+                )
+            window_announced = active
+            forced = store.data["force_limits"]
+            delay = 10.0 if forced or active else 120.0
             try:
                 await agent.check(allow_booking=True)
             except NetworkBlocked:
@@ -387,6 +486,8 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
                 if cancel.is_set():
                     return 0
                 print(str(exc), file=sys.stderr)
+            finally:
+                sport.opening_window_active = False
             for ident in sorted(agent.confirmed_ids):
                 print(f"{ident}  Записан")
                 previous.pop((ident, False), None)
@@ -402,7 +503,10 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
                     print("Проверьте запись в My ITMO; повторная попытка требует подтверждения.", file=sys.stderr)
                     return 4
                 return 0
-            delay = auto_delay(now(), delay)
+            local_now = datetime.fromtimestamp(now(), MSK)
+            midnight = datetime.combine(local_now.date() + timedelta(days=1), datetime.min.time(), MSK)
+            until_midnight = midnight.timestamp() - now()
+            delay = min(delay, max(10.0, until_midnight))
             try:
                 await asyncio.wait_for(cancel.wait(), timeout=delay)
             except TimeoutError:
@@ -655,9 +759,25 @@ def main() -> int:
             print("Не найден TUI. Переустановите: uv tool install --force . или pipx reinstall kronbot", file=sys.stderr)
             return 2
         return run()
-    if (args.command not in ("browser", "book", "watch", "service", "ntfy")
+    if (args.command not in ("browser", "book", "watch", "service", "ntfy", "limits")
+            and not (args.command == "queue" and args.queue_command == "diagnose")
             and sys.stdin.isatty() and sys.stderr.isatty()):
         _interactive_update_notice()
+    if args.command == "limits":
+        try:
+            with StateStore() as store:
+                if store.data["force_limits"] and args.limits_command != "force":
+                    _force_warning()
+                return _limits_command(args, store)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except (StateLocked, StateError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    if args.command in ("doctor", "browser", "service"):
+        directory = args.state_dir if args.command == "service" and args.service_command == "run" else None
+        _warn_forced_state(directory)
     if args.command == "doctor":
         return _doctor()
     if args.command == "browser":
@@ -673,6 +793,8 @@ def main() -> int:
     if args.command == "ntfy":
         try:
             with StateStore() as store:
+                if store.data["force_limits"]:
+                    _force_warning()
                 return _ntfy_command(args, store)
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
@@ -691,6 +813,8 @@ def main() -> int:
         print(f"Предупреждение: {notice}", file=sys.stderr)
     try:
         with StateStore() as store:
+            if store.data["force_limits"]:
+                _force_warning()
             if store.data["background_paused"]:
                 print(f"Предупреждение: {SERVICE_PAUSED_NOTICE}", file=sys.stderr)
             return asyncio.run(_run(args, store))

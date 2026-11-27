@@ -381,11 +381,12 @@ async def test_schedule_filters_selection_and_account(tmp_path):
         await app.sport.close()
 
 
-async def test_auto_cycle_reserves_midnight(tmp_path):
+async def test_auto_cycle_reserves_midnight(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
     from kronbot.agent import MSK
 
     midnight = datetime(2030, 3, 20, 0, 0, tzinfo=MSK).timestamp()
+    monkeypatch.setattr("kronbot.tui.opening_window", lambda store, now: now >= midnight)
     clock = {"wall": midnight - 180, "mono": 0}
     with StateStore(tmp_path / "state") as store:
         store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": midnight + 10000, "refresh_token": None, "refresh_expires_at": None}
@@ -412,11 +413,12 @@ async def test_auto_cycle_reserves_midnight(tmp_path):
         await app.sport.close()
 
 
-async def test_first_auto_cycle_waits_for_midnight_but_manual_refresh_does_not(tmp_path):
+async def test_first_auto_cycle_waits_for_midnight_but_manual_refresh_does_not(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
     from kronbot.agent import MSK
 
     midnight = datetime(2030, 3, 20, 0, 0, tzinfo=MSK).timestamp()
+    monkeypatch.setattr("kronbot.tui.opening_window", lambda store, now: now >= midnight)
     clock = {"wall": midnight - 5, "mono": 0}
     with StateStore(tmp_path / "state") as store:
         store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": midnight + 10000, "refresh_token": None, "refresh_expires_at": None}
@@ -458,9 +460,10 @@ async def test_automatic_forecast_rows_and_selection(tmp_path):
     )
     duplicate = replace(prototype, id=43)
     incomplete = replace(prototype, id=44, teacher_isu=None)
-    target = replace(prototype, id=45, starts_at=start + timedelta(days=14),
+    target = replace(prototype, id=45, type_id=6, starts_at=start + timedelta(days=14),
                      ends_at=prototype.ends_at + timedelta(days=14))
     assert forecast_prototypes([duplicate, prototype, incomplete], now) == [prototype]
+    assert forecast_prototypes([incomplete], now) == [incomplete]
     assert forecast_prototypes([prototype, target], now) == [target]
     with StateStore(tmp_path / "state") as store:
         store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
@@ -994,4 +997,318 @@ async def test_ntfy_settings_in_account(tmp_path):
             await pilot.pause()
             assert store.data["ntfy"] is None
             assert "отключены" in str(app.query_one("#account", Static).render())
+        await app.sport.close()
+
+
+async def test_force_limits_confirmation_persistence_and_visibility(tmp_path):
+    from unittest.mock import AsyncMock
+    from textual.widgets import Button, Static, TabbedContent
+    from kronbot.tui import ForceLimitsScreen
+
+    now = 1900000000
+    path = tmp_path / "state"
+    with StateStore(path) as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "account-tab"
+            await pilot.pause()
+            await pilot.click("#account-force")
+            assert isinstance(app.screen, ForceLimitsScreen)
+            assert app.screen.focused == app.screen.query_one("#no", Button)
+            disclaimer = str(app.screen.query_one("#force-disclaimer", Static).render())
+            for phrase in ("60", "10 секунд", "120", "фоновую службу", "403/429"):
+                assert phrase in disclaimer
+            assert app.screen.query_one("#no").region.bottom <= 24
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not store.data["force_limits"]
+            await pilot.click("#account-force")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not store.data["force_limits"]
+            app.limit_until = now + 3600
+            store.data["blocked_until"]["my.itmo.ru"] = now + 300
+            app.error = "Серверная блокировка"
+            await pilot.click("#account-force")
+            await pilot.click("#yes")
+            await pilot.pause()
+            assert store.data["force_limits"]
+            assert app.limit_until == 0
+            assert store.data["blocked_until"]["my.itmo.ru"] == now + 300
+            assert app.error == "Серверная блокировка"
+            app.action_pause()
+            assert not app.auto
+            warning = app.query_one("#force-warning", Static)
+            assert warning.display and warning.region.height == 1 and warning.region.bottom <= 24
+            assert "10 с" in str(warning.render())
+            app.query_one(TabbedContent).active = "calendar-tab"
+            await pilot.pause()
+            assert warning.display and app.query_one("#calendar", DataTable).region.height > 0
+            app.query_one(TabbedContent).active = "account-tab"
+            await pilot.pause()
+            await pilot.click("#account-force")
+            await pilot.pause()
+            assert not store.data["force_limits"]
+            assert not warning.display
+        await app.sport.close()
+    with StateStore(path) as store:
+        assert store.data["force_limits"] is False
+
+
+async def test_force_limits_save_failure_rolls_back(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from textual.widgets import Static, TabbedContent
+    from kronbot.state import StateError
+
+    now = 1900000000
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "account-tab"
+            await pilot.pause()
+            def fail_save():
+                raise StateError("failure")
+            monkeypatch.setattr(store, "save", fail_save)
+            await pilot.click("#account-force")
+            await pilot.click("#yes")
+            await pilot.pause()
+            assert store.data["force_limits"] is False
+            assert not app.query_one("#force-warning", Static).display
+            assert "Не удалось сохранить" in str(app.query_one("#error", Static).render())
+            store.data["force_limits"] = True
+            app._render()
+            await pilot.click("#account-force")
+            await pilot.pause()
+            assert store.data["force_limits"] is True
+            assert app.query_one("#force-warning", Static).display
+        await app.sport.close()
+
+
+async def test_force_auto_skips_opening_wait_and_uses_ten_second_interval(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from kronbot.agent import MSK
+
+    midnight = datetime(2030, 3, 20, 0, 0, tzinfo=MSK).timestamp()
+    monkeypatch.setattr("kronbot.tui.opening_window", lambda store, now: False)
+    clock = {"wall": midnight - 5, "mono": 0}
+    with StateStore(tmp_path / "state") as store:
+        store.data["force_limits"] = True
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": midnight + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Бег", "starts_at": datetime.fromtimestamp(midnight + 86400, timezone.utc).isoformat(), "status": "waiting", "refusal_code": None}]
+        app = KronbotApp(store, now=lambda: clock["wall"], monotonic=lambda: clock["mono"])
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            assert app.agent.check.await_count == 2
+            assert app.auto_interval == 10
+            clock["mono"] = 9
+            app._tick()
+            await pilot.pause()
+            assert app.agent.check.await_count == 2
+            clock["mono"] = 10
+            app._tick()
+            await pilot.pause()
+            assert app.agent.check.await_count == 3
+        await app.sport.close()
+
+
+async def test_forecast_diagnostics_tab_refresh_and_account_isolation(tmp_path):
+    from unittest.mock import AsyncMock
+    from textual.widgets import TabbedContent
+    from kronbot.agent import MSK
+
+    now = 1900000000
+    starts = "2030-03-20T08:10:00+03:00"
+    reports = [
+        {"prototype_id": 42, "starts_at": starts, "status": "not_checked",
+         "checked_at": None, "real_id": None, "differences": []},
+        {"prototype_id": 43, "starts_at": starts, "status": "ambiguous",
+         "checked_at": now, "real_id": None, "differences": ["неподтверждённое отличие"]},
+        {"prototype_id": 44, "starts_at": starts, "status": "matched",
+         "checked_at": now, "real_id": 144, "differences": ["Зал изменился", "Преподаватель изменился"]},
+    ]
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.forecast_diagnostics = lambda: reports if store.data["session"]["sub"] == "owner" else []
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "forecasts-tab"
+            table = app.query_one("#forecasts", DataTable)
+            table.focus()
+            await pilot.pause()
+            pending, ambiguous, matched = (table.get_row(f"{ident}:{starts}") for ident in (42, 43, 44))
+            assert "не проверен" in str(pending[2]) and str(pending[4]) == "—"
+            assert "Несколько совпадений" in str(ambiguous[2])
+            assert str(ambiguous[3]) == str(ambiguous[5]) == "—"
+            assert str(matched[1]) == "20.03.2030 08:10"
+            assert str(matched[3]) == "144"
+            assert str(matched[4]) == datetime.fromtimestamp(now, MSK).strftime("%d.%m.%Y %H:%M")
+            assert "Зал изменился" in str(matched[5]) and "Преподаватель изменился" in str(matched[5])
+            assert not app.agent.queue()  # отчёт остаётся видимым после удаления записи из очереди
+            reports[0].update(status="no_match", checked_at=now)
+            await pilot.press("r")
+            await pilot.pause()
+            app.agent.check.assert_awaited_with(allow_booking=False)
+            assert "не найдено" in str(table.get_row(f"42:{starts}")[2])
+            assert app.focused is table
+            store.data["session"]["sub"] = "other"
+            app._render()
+            assert "Нет прогнозов" in str(table.get_row_at(0)[1])
+        await app.sport.close()
+
+
+async def test_forecast_diagnostics_scroll_and_focus_at_80x24(tmp_path):
+    from unittest.mock import AsyncMock
+    from textual.widgets import TabbedContent
+
+    now = 1900000000
+    starts = "2030-03-20T08:10:00+03:00"
+    reports = [
+        {"prototype_id": ident, "starts_at": starts, "status": "not_open",
+         "checked_at": now, "real_id": None, "differences": []}
+        for ident in range(30)
+    ]
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.forecast_diagnostics = lambda: reports
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_one(TabbedContent).active = "forecasts-tab"
+            table = app.query_one("#forecasts", DataTable)
+            table.focus()
+            table.move_cursor(row=25)
+            await pilot.pause()
+            scroll = table.scroll_y
+            assert scroll > 0
+            await pilot.press("r")
+            await pilot.pause()
+            assert app.focused is table
+            assert app._selected(table) == f"25:{starts}"
+            assert table.scroll_y == scroll
+            await pilot.press("down")
+            assert app._selected(table) == f"26:{starts}"
+        await app.sport.close()
+
+
+async def test_opening_window_preempts_deadline_and_preserves_ten_second_interval(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from textual.widgets import Static
+    from kronbot.agent import MSK
+
+    midnight = datetime(2030, 3, 20, tzinfo=MSK).timestamp()
+    clock = {"wall": midnight - 60, "mono": 60}
+    monkeypatch.setattr("kronbot.tui.opening_window", lambda store, now: midnight <= now < midnight + 300)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": midnight + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Бег", "starts_at": datetime.fromtimestamp(midnight + 86400, timezone.utc).isoformat(), "status": "waiting", "refusal_code": None}]
+        app = KronbotApp(store, now=lambda: clock["wall"], monotonic=lambda: clock["mono"])
+        flags = []
+        async def check(*, allow_booking):
+            flags.append((allow_booking, app.sport.opening_window_active))
+        app.agent.check = AsyncMock(side_effect=check)
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            app.limit_until = midnight + 1000
+            clock.update(wall=midnight, mono=120)
+            app._tick()
+            await pilot.pause()
+            assert flags[-1] == (True, True)
+            assert not app.sport.opening_window_active
+            assert app.query_one("#opening-warning", Static).display
+            count = len(flags)
+            clock.update(wall=midnight + 9, mono=129)
+            app._tick()
+            await pilot.pause()
+            assert len(flags) == count
+            clock.update(wall=midnight + 10, mono=130)
+            app._tick()
+            await pilot.pause()
+            assert len(flags) == count + 1 and flags[-1] == (True, True)
+            clock.update(wall=midnight + 300, mono=420)
+            app._tick()
+            await pilot.pause()
+            assert len(flags) == count + 1
+            assert not app.query_one("#opening-warning", Static).display
+            await pilot.press("r")
+            await pilot.pause()
+            assert flags[-1] == (False, False)
+        await app.sport.close()
+
+
+async def test_opening_window_save_failure_prevents_automatic_network(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from kronbot.state import StateError
+
+    now = 1900000000
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Бег", "starts_at": datetime.fromtimestamp(now + 86400, timezone.utc).isoformat(), "status": "waiting", "refusal_code": None}]
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.agent.check.reset_mock()
+            def fail(store, now):
+                raise StateError("Не удалось сохранить окно")
+            monkeypatch.setattr("kronbot.tui.opening_window", fail)
+            await pilot.press("p")
+            await pilot.pause()
+            app.agent.check.assert_not_awaited()
+            assert "Не удалось сохранить окно" in app.error
+            assert not app.sport.opening_window_active
+        await app.sport.close()
+
+
+async def test_opening_window_stops_on_server_block(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from kronbot.sport import NetworkBlocked
+
+    now = 1900000000
+    clock = {"wall": now, "mono": 0}
+    monkeypatch.setattr("kronbot.tui.opening_window", lambda store, current: True)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Бег", "starts_at": datetime.fromtimestamp(now + 86400, timezone.utc).isoformat(), "status": "waiting", "refusal_code": None}]
+        app = KronbotApp(store, now=lambda: clock["wall"], monotonic=lambda: clock["mono"])
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.agent.check.reset_mock()
+            async def blocked(*, allow_booking):
+                assert allow_booking and app.sport.opening_window_active
+                store.data["blocked_until"]["my.itmo.ru"] = now + 300
+                raise NetworkBlocked(now + 300)
+            app.agent.check.side_effect = blocked
+            await pilot.press("p")
+            await pilot.pause()
+            assert app.agent.check.await_count == 1
+            assert not app.auto and not app.sport.opening_window_active
+            assert store.data["background_paused"]
+            clock.update(wall=now + 10, mono=10)
+            app._tick()
+            await pilot.press("p")
+            await pilot.pause()
+            assert not app.auto and app.agent.check.await_count == 1
         await app.sport.close()

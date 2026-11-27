@@ -34,7 +34,8 @@ def state_directory() -> Path:
 def empty_state():
     return {"version": 1, "session": None, "queues": {}, "sport_request_times": [],
             "last_enroll_at": None, "blocked_until": {}, "background_paused": False,
-            "ntfy": None}
+            "ntfy": None, "force_limits": False, "forecast_reports": {},
+            "opening_window": None}
 
 
 def _integer(value):
@@ -51,46 +52,41 @@ def _validate_forecast(forecast, starts_at):
         raise ValueError()
     if type(forecast["bound"]) is not bool or any(
         not _integer(forecast[key]) or forecast[key] <= 0
-        for key in ("prototype_lesson_id", "section_id", "teacher_isu", "time_slot_id")
+        for key in ("prototype_lesson_id", "section_id")
     ):
         raise ValueError()
-    if (
-        forecast["type_id"] != 2 or type(forecast["type_id"]) is not int
-        or not _integer(forecast["section_level"])
-        or not _integer(forecast["lesson_level"])
-        or not isinstance(forecast["teacher_name"], str)
-        or not isinstance(forecast["room_name"], str)
-    ):
+    if (type(forecast["type_id"]) is not int or forecast["type_id"] not in (2, 6)
+            or type(forecast["section_level"]) is not int or forecast["section_level"] != 1
+            or any(not isinstance(forecast[key], str) for key in ("teacher_name", "room_name"))
+            or any(forecast[key] is not None and not _integer(forecast[key])
+                   for key in ("teacher_isu", "building_id", "room_id", "lesson_level", "time_slot_id"))):
         raise ValueError()
-    building, room = forecast["building_id"], forecast["room_id"]
-    if not (
-        (_integer(building) and building > 0 and _integer(room) and room > 0)
-        or (building is None or _integer(building) and building == -1)
-        and _integer(room) and room == -1
-    ):
+    prototype_start = datetime.fromisoformat(forecast["prototype_starts_at"])
+    if prototype_start.utcoffset() is None or starts_at != prototype_start + timedelta(days=14):
         raise ValueError()
-    dates = []
-    for key in ("prototype_starts_at", "prototype_ends_at", "predicted_ends_at"):
-        if not isinstance(forecast[key], str):
+    end, predicted = forecast["prototype_ends_at"], forecast["predicted_ends_at"]
+    if (end is None) != (predicted is None):
+        raise ValueError()
+    if end is not None:
+        prototype_end, predicted_end = datetime.fromisoformat(end), datetime.fromisoformat(predicted)
+        if (prototype_end.utcoffset() is None or predicted_end.utcoffset() is None
+                or prototype_end <= prototype_start or predicted_end != prototype_end + timedelta(days=14)):
             raise ValueError()
-        date = datetime.fromisoformat(forecast[key])
-        if date.utcoffset() is None:
-            raise ValueError()
-        dates.append(date)
-    prototype_start, prototype_end, predicted_end = dates
-    if (
-        prototype_end <= prototype_start
-        or starts_at != prototype_start + timedelta(days=14)
-        or predicted_end != prototype_end + timedelta(days=14)
-    ):
-        raise ValueError()
 
 
 def _validate_state(data):
     if not isinstance(data, dict) or set(data) != set(empty_state()) or data["version"] != 1 or type(data["version"]) is not int:
         raise ValueError()
-    if type(data["background_paused"]) is not bool:
+    if type(data["background_paused"]) is not bool or type(data["force_limits"]) is not bool:
         raise ValueError()
+    window = data["opening_window"]
+    if window is not None:
+        if (not isinstance(window, dict) or set(window) != {"day", "until"}
+                or not isinstance(window["day"], str) or not _integer(window["until"])):
+            raise ValueError()
+        from datetime import date
+        if date.fromisoformat(window["day"]).isoformat() != window["day"]:
+            raise ValueError()
     ntfy = data["ntfy"]
     if ntfy is not None:
         if not isinstance(ntfy, dict) or set(ntfy) != {"url", "token", "last_error"}:
@@ -101,6 +97,32 @@ def _validate_state(data):
         if any(value is not None and not isinstance(value, str)
                for value in (ntfy["token"], ntfy["last_error"])):
             raise ValueError()
+    reports = data["forecast_reports"]
+    if not isinstance(reports, dict):
+        raise ValueError()
+    for sub, entries in reports.items():
+        active = sum(1 for item in data["queues"].get(sub, [])
+                     if isinstance(item, dict) and "forecast" in item) if isinstance(data["queues"], dict) else 0
+        if not isinstance(sub, str) or not sub or not isinstance(entries, list) or len(entries) > 200 + active:
+            raise ValueError()
+        keys = set()
+        for report in entries:
+            if (not isinstance(report, dict) or set(report) != {
+                    "prototype_id", "starts_at", "status", "checked_at", "real_id", "differences"}
+                    or not _integer(report["prototype_id"]) or report["prototype_id"] <= 0
+                    or not isinstance(report["starts_at"], str)
+                    or datetime.fromisoformat(report["starts_at"]).utcoffset() is None
+                    or report["status"] not in {"not_checked", "not_open", "no_match", "ambiguous", "incomplete", "matched"}
+                    or (report["checked_at"] is not None and not _integer(report["checked_at"]))
+                    or (report["real_id"] is not None and
+                        (not _integer(report["real_id"]) or report["real_id"] <= 0))
+                    or not isinstance(report["differences"], list)
+                    or any(not isinstance(value, str) for value in report["differences"])):
+                raise ValueError()
+            key = (report["prototype_id"], report["starts_at"])
+            if key in keys:
+                raise ValueError()
+            keys.add(key)
     session = data["session"]
     if session is not None:
         if not isinstance(session, dict) or set(session) not in ({
@@ -235,6 +257,12 @@ class StateStore:
                     outer["background_paused"] = False
                 if isinstance(outer, dict) and "ntfy" not in outer:
                     outer["ntfy"] = None
+                if isinstance(outer, dict) and "force_limits" not in outer:
+                    outer["force_limits"] = False
+                if isinstance(outer, dict) and "forecast_reports" not in outer:
+                    outer["forecast_reports"] = {}
+                if isinstance(outer, dict) and "opening_window" not in outer:
+                    outer["opening_window"] = None
                 _validate_state(outer)
                 self.data = outer
             return self

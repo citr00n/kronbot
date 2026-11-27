@@ -36,6 +36,11 @@ async def test_service_releases_lock_and_books_new_queue_items(tmp_path):
     directory = tmp_path / "state"
     with StateStore(directory) as store:
         store.data["session"] = session(clock["wall"])
+        from kronbot.agent import MSK
+        store.data["opening_window"] = {
+            "day": datetime.fromtimestamp(clock["wall"], MSK).date().isoformat(),
+            "until": clock["wall"] - 1,
+        }
         store.save()
     runner = BackgroundRunner(directory, now=lambda: clock["wall"], monotonic=lambda: clock["mono"],
                               client_factory=lambda store, now: SportClient(store, now=now, transport=httpx.MockTransport(handler)))
@@ -170,6 +175,10 @@ async def test_service_reserves_midnight_without_shortening_interval(tmp_path, r
         store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Секция",
                                           "starts_at": start, "status": "waiting",
                                           "refusal_code": None}]
+        store.data["opening_window"] = {
+            "day": datetime.fromtimestamp(clock["wall"], MSK).date().isoformat(),
+            "until": int(clock["wall"] - 1),
+        }
         store.save()
     runner = BackgroundRunner(directory, now=lambda: clock["wall"], monotonic=lambda: clock["mono"],
                               client_factory=lambda store, now: SportClient(
@@ -178,8 +187,9 @@ async def test_service_reserves_midnight_without_shortening_interval(tmp_path, r
     await runner.cycle()
     assert len(calls) == 1
     assert runner.next_check == 1000 + expected
-    clock["wall"] += expected - 1
-    clock["mono"] += expected - 1
+    elapsed = min(expected, remaining)
+    clock["wall"] += elapsed - 1
+    clock["mono"] += elapsed - 1
     await runner.cycle()
     assert len(calls) == 1
     clock["wall"] += 1

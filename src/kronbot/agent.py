@@ -11,6 +11,26 @@ from . import notifications
 
 MSK = timezone(timedelta(hours=3))
 
+def opening_window(store, now) -> bool:
+    """Начать единственное за день окно быстрого опроса, сохранив его до сети."""
+    session = store.data["session"]
+    if (session is None or store.data["background_paused"]
+            or not any(item["status"] == "waiting"
+                       for item in store.data["queues"].get(session["sub"], []))):
+        return False
+    day = datetime.fromtimestamp(now, MSK).date().isoformat()
+    previous = store.data["opening_window"]
+    if previous is not None and previous["day"] >= day:
+        return previous["day"] == day and previous["until"] - 300 <= now < previous["until"]
+    store.data["opening_window"] = {"day": day, "until": int(now) + 300}
+    try:
+        store.save()
+    except StateError:
+        store.data["opening_window"] = previous
+        raise
+    return True
+
+
 def opening_wait(now: float) -> float:
     """Резервировать полночь перед первым автоциклом с ожидающей очередью."""
     local_now = datetime.fromtimestamp(now, MSK)
@@ -20,8 +40,10 @@ def opening_wait(now: float) -> float:
     return remaining if 0 < remaining < 120 else 0.0
 
 
-def auto_delay(now: float, minimum: float = 120.0) -> float:
-    """Задержка после автоцикла с резервированием открытия в полночь МСК."""
+def auto_delay(now: float, minimum: float = 120.0, *, forced: bool = False) -> float:
+    """Задержка после автоцикла; форсированный режим не резервирует полночь."""
+    if forced:
+        return max(10.0, minimum)
     local_now = datetime.fromtimestamp(now, MSK)
     tomorrow = local_now.date() + timedelta(days=1)
     midnight = datetime.combine(tomorrow, datetime.min.time(), MSK).timestamp()
@@ -54,6 +76,7 @@ class Agent:
         self._cycle_lock = asyncio.Lock()
         self.cancelling_ids = set()
         self.confirmed_ids: set[int] = set()
+        self._notification_events = []
 
     def queue(self):
         session = self.store.data["session"]
@@ -95,8 +118,8 @@ class Agent:
             "type_id": lesson.type_id,
             "time_slot_id": lesson.time_slot_id,
             "prototype_starts_at": lesson.starts_at.isoformat(),
-            "prototype_ends_at": lesson.ends_at.isoformat(),
-            "predicted_ends_at": (lesson.ends_at + timedelta(days=14)).isoformat(),
+            "prototype_ends_at": lesson.ends_at.isoformat() if lesson.ends_at else None,
+            "predicted_ends_at": (lesson.ends_at + timedelta(days=14)).isoformat() if lesson.ends_at else None,
             "teacher_name": lesson.teacher_name,
             "room_name": lesson.room_name,
         }
@@ -106,69 +129,188 @@ class Agent:
             "refusal_code": None, "forecast": forecast,
         }
         queue.append(item)
+        sub = self.store.data["session"]["sub"]
+        histories = self.store.data["forecast_reports"]
+        old_reports = histories.get(sub)
+        reports = [report for report in (old_reports or [])
+                   if (report["prototype_id"], report["starts_at"]) != (lesson.id, item["starts_at"])]
+        reports.append({"prototype_id": lesson.id, "starts_at": item["starts_at"],
+                        "status": "not_checked", "checked_at": None,
+                        "real_id": None, "differences": []})
+        histories[sub] = reports
+        self._trim_reports(queue)
         try:
             self.store.save()
         except StateError:
             queue.remove(item)
+            if old_reports is None:
+                histories.pop(sub, None)
+            else:
+                histories[sub] = old_reports
             raise
+
+    def forecast_diagnostics(self):
+        session = self.store.data["session"]
+        if session is None:
+            raise LoginRequired("Нужен новый вход.")
+        reports = [dict(report, differences=list(report["differences"]))
+                   for report in self.store.data["forecast_reports"].get(session["sub"], [])]
+        keys = {(report["prototype_id"], report["starts_at"]) for report in reports}
+        for item in self.queue():
+            forecast = item.get("forecast")
+            if forecast and (forecast["prototype_lesson_id"], item["starts_at"]) not in keys:
+                reports.append({"prototype_id": forecast["prototype_lesson_id"],
+                                "starts_at": item["starts_at"], "status": "not_checked",
+                                "checked_at": None, "real_id": None, "differences": []})
+        return reports
 
     @staticmethod
     def _matches_forecast(item, lesson):
-        forecast = item["forecast"]
         return forecast_identity(lesson) == (
-            forecast["section_id"], forecast["teacher_isu"],
-            None if forecast["room_id"] == -1 else forecast["building_id"],
-            forecast["room_id"],
-            forecast["section_level"], forecast["lesson_level"],
-            forecast["type_id"], forecast["time_slot_id"],
-            datetime.fromisoformat(item["starts_at"]),
-            datetime.fromisoformat(forecast["predicted_ends_at"]),
+            item["forecast"]["section_id"], 1, 2, datetime.fromisoformat(item["starts_at"])
         )
 
-    def _bind_forecasts(self, queue, snapshot):
-        # A collision keeps the existing entry, especially an uncertain one.
+    @staticmethod
+    def _possible_competitor(raw, item):
+        if not isinstance(raw, dict):
+            return True
+        forecast = item["forecast"]
+        for key, expected in (("section_id", forecast["section_id"]), ("section_level", 1)):
+            value = raw.get(key)
+            if type(value) is int and value > 0 and value != expected:
+                return False
+        typ = raw.get("type_id")
+        if type(typ) is int and typ > 0 and typ not in (2, 6):
+            return False
+        try:
+            starts = datetime.fromisoformat(raw["date"])
+            if starts.utcoffset() is not None and starts != datetime.fromisoformat(item["starts_at"]):
+                return False
+        except (KeyError, TypeError, ValueError):
+            pass
+        return True
+
+    @staticmethod
+    def _forecast_differences(item, lesson):
+        forecast = item["forecast"]
+        fields = (
+            ("teacher_isu", "teacher_isu", "преподаватель (ИСУ)"),
+            ("teacher_name", "teacher_name", "имя преподавателя"),
+            ("building_id", "building_id", "здание"),
+            ("room_id", "room_id", "зал (ID)"),
+            ("room_name", "room_name", "название зала"),
+            ("lesson_level", "lesson_level", "уровень занятия"),
+            ("time_slot_id", "time_slot_id", "временной слот"),
+            ("predicted_ends_at", "ends_at", "время окончания"),
+        )
+        differences = []
+        if forecast["type_id"] != lesson.type_id:
+            differences.append(f"тип занятия ({forecast['type_id']} → {lesson.type_id})")
+        for key, attr, label in fields:
+            old, new = forecast[key], getattr(lesson, attr)
+            if key == "predicted_ends_at":
+                old = datetime.fromisoformat(old) if old else None
+            if old != new:
+                differences.append(label)
+        if item["section_name"] != lesson.section_name:
+            differences.append("название секции")
+        return differences
+
+    def _bind_forecasts(self, queue, snapshot, end=None):
+        sub = self.store.data["session"]["sub"]
+        if end is None:
+            end = datetime.fromtimestamp(self.now(), MSK).date() + timedelta(days=14)
+        histories = self.store.data["forecast_reports"]
+        old_reports = histories.get(sub)
+        reports = [dict(report, differences=list(report["differences"]))
+                   for report in (old_reports or [])]
         original = queue[:]
-        if getattr(self.sport, "forecast_incomplete", False):
-            return
-        ambiguous_times = getattr(self.sport, "forecast_ambiguous_times", set())
-        changed = []
+        changes = []
+        blocked = set()
+        events = []
         for item in original:
             forecast = item.get("forecast")
-            if not forecast or forecast["bound"] or item["status"] != "waiting":
+            if not forecast or item["status"] != "waiting":
                 continue
             target = datetime.fromisoformat(item["starts_at"])
-            if target in ambiguous_times or any(
-                lesson.starts_at == target and forecast_identity(lesson) is None
-                for lesson in snapshot
-            ):
-                continue
             matches = [lesson for lesson in snapshot if self._matches_forecast(item, lesson)]
-            if len(matches) != 1:
-                continue
-            lesson = matches[0]
-            existing = next(
-                (other for other in queue if other is not item
-                 and not _unbound_forecast(other) and other["lesson_id"] == lesson.id),
-                None,
-            )
-            if existing is not None:
-                if existing["status"] in {"rejected", "expired"}:
-                    continue
-                queue.remove(item)
+            broken = any(self._possible_competitor(raw, item)
+                         for raw in getattr(self.sport, "forecast_invalid_rows", []))
+            if target.astimezone(MSK).date() > end:
+                status = "not_open"
+            elif len(matches) > 1:
+                status = "ambiguous"
+            elif broken:
+                status = "incomplete"
+            elif not matches:
+                status = "no_match"
+            elif forecast["bound"] and item["lesson_id"] != matches[0].id:
+                status = "ambiguous"
             else:
-                changed.append((item, item["lesson_id"]))
-                item["lesson_id"] = lesson.id
-                forecast["bound"] = True
-        if queue == original and not changed:
-            return
+                status = "matched"
+            real_id, differences = None, []
+            if status == "matched":
+                lesson = matches[0]
+                existing = next((other for other in queue if other is not item
+                                 and not _unbound_forecast(other)
+                                 and other["lesson_id"] == lesson.id), None)
+                if existing is not None:
+                    status = "ambiguous"
+                else:
+                    real_id = lesson.id
+                    differences = self._forecast_differences(item, lesson)
+                    if not forecast["bound"]:
+                        changes.append((item, item["lesson_id"]))
+                        item["lesson_id"] = lesson.id
+                        forecast["bound"] = True
+                        if differences:
+                            events.append("kronbot: прогноз связан с занятием; изменились: "
+                                          + ", ".join(differences) + ".")
+            if status != "matched":
+                blocked.add(id(item))
+            report = {"prototype_id": forecast["prototype_lesson_id"], "starts_at": item["starts_at"],
+                      "status": status, "checked_at": int(self.now()), "real_id": real_id,
+                      "differences": differences}
+            reports = [old for old in reports if (old["prototype_id"], old["starts_at"])
+                       != (report["prototype_id"], report["starts_at"])]
+            reports.append(report)
+        active = {(item["forecast"]["prototype_lesson_id"], item["starts_at"])
+                  for item in queue if item.get("forecast")}
+        archived = [report for report in reports
+                    if (report["prototype_id"], report["starts_at"]) not in active]
+        kept = {id(report) for report in archived[-200:]}
+        histories[sub] = [report for report in reports
+                          if (report["prototype_id"], report["starts_at"]) in active
+                          or id(report) in kept]
         try:
             self.store.save()
         except StateError:
-            queue[:] = original
-            for item, ident in changed:
+            if old_reports is None:
+                histories.pop(sub, None)
+            else:
+                histories[sub] = old_reports
+            for item, ident in changes:
                 item["lesson_id"] = ident
                 item["forecast"]["bound"] = False
             raise
+        self._notification_events.extend(events)
+        return blocked
+
+    def _trim_reports(self, queue):
+        histories = self.store.data["forecast_reports"]
+        sub = self.store.data["session"]["sub"]
+        old = histories.get(sub)
+        if old is None:
+            return None
+        active = {(item["forecast"]["prototype_lesson_id"], item["starts_at"])
+                  for item in queue if item.get("forecast")}
+        archived = [report for report in old
+                    if (report["prototype_id"], report["starts_at"]) not in active]
+        keep = {id(report) for report in archived[-200:]}
+        histories[sub] = [report for report in old
+                          if (report["prototype_id"], report["starts_at"]) in active
+                          or id(report) in keep]
+        return old
 
     def remove(self, lesson_id, *, verified=False, forecast=None):
         queue = self.queue()
@@ -185,10 +327,13 @@ class Agent:
             raise QueueError("Операция неприменима. Проверьте запись в My ITMO.")
         index = queue.index(item)
         queue.remove(item)
+        old_reports = self._trim_reports(queue)
         try:
             self.store.save()
         except StateError:
             queue.insert(index, item)
+            if old_reports is not None:
+                self.store.data["forecast_reports"][self.store.data["session"]["sub"]] = old_reports
             raise
 
     def retry(self, lesson_id, *, verified=False, forecast=None):
@@ -219,10 +364,13 @@ class Agent:
         original = queue[:]
         queue[:] = [item for item in queue
                     if item["lesson_id"] not in ids or _unbound_forecast(item)]
+        old_reports = self._trim_reports(queue)
         try:
             self.store.save()
         except StateError:
             queue[:] = original
+            if old_reports is not None:
+                self.store.data["forecast_reports"][self.store.data["session"]["sub"]] = old_reports
             raise
         self.confirmed_ids.update(item["lesson_id"] for item in confirmed)
         self._notification_events.extend(
@@ -338,10 +486,13 @@ class Agent:
                     raise
                 queue[:] = [entry for entry in queue
                             if entry["lesson_id"] not in ids or _unbound_forecast(entry)]
+                old_reports = self._trim_reports(queue)
                 try:
                     self.store.save()
                 except Exception:
                     queue[:] = protected
+                    if old_reports is not None:
+                        self.store.data["forecast_reports"][sub] = old_reports
                     raise QueueError(
                         "Отмена подтверждена, но не удалось сохранить очередь. Проверьте запись в My ITMO."
                     ) from None
@@ -397,7 +548,7 @@ class Agent:
                 item["lesson_id"] == only_lesson_id and not _unbound_forecast(item)
                 for item in queue
             )
-            self._bind_forecasts(queue, snapshot)
+            blocked_forecasts = self._bind_forecasts(queue, snapshot, end)
             if originally_targeted and not any(
                 item["lesson_id"] == only_lesson_id and not _unbound_forecast(item)
                 for item in queue
@@ -418,6 +569,7 @@ class Agent:
                 item["lesson_id"]
                 for item in queue
                 if not (item.get("forecast") and not item["forecast"]["bound"])
+                if id(item) not in blocked_forecasts or item["status"] == "uncertain"
                 if (lesson := by_id.get(item["lesson_id"])) is not None
                 and (not item.get("forecast") or self._matches_forecast(item, lesson))
                 and lesson.signed
@@ -441,7 +593,7 @@ class Agent:
             for item in queue:
                 lesson = by_id.get(item["lesson_id"])
                 if item.get("forecast") and (
-                    not item["forecast"]["bound"]
+                    id(item) in blocked_forecasts or not item["forecast"]["bound"]
                     or lesson is None
                     or not self._matches_forecast(item, lesson)
                 ):
