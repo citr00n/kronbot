@@ -28,19 +28,19 @@
 
 Нужны Python 3.12.4+ и [uv](https://docs.astral.sh/uv/getting-started/installation/) либо [pipx](https://pipx.pypa.io/stable/installation/). Целевые системы: macOS 14+, Windows 11, Ubuntu 24.04 и Debian 12.
 
-Скачайте проект, откройте терминал и перейдите в его корневой каталог (где находится `pyproject.toml`). Установите программу одной из команд:
+Установите пакет из [PyPI](https://pypi.org/project/kronbot/); скачивать исходный код не нужно:
 
 ```sh
-uv tool install .
+uv tool install kronbot
 ```
 
 Или, если используете pipx:
 
 ```sh
-pipx install .
+pipx install kronbot
 ```
 
-Команды устанавливают приложение из скачанного проекта, а не из PyPI. После установки `kronbot` доступен из любого каталога: `kronbot` или `kronbot tui` открывает терминальный интерфейс, `kronbot --help` показывает CLI-команды. Если команда не найдена, выполните `uv tool update-shell` для uv или `pipx ensurepath` для pipx и откройте новый терминал.
+После установки `kronbot` доступен из любого каталога: `kronbot` или `kronbot tui` открывает терминальный интерфейс, `kronbot --help` показывает CLI-команды. Если команда не найдена, выполните `uv tool update-shell` для uv или `pipx ensurepath` для pipx и откройте новый терминал.
 
 Фоновая служба — основная часть приложения: TUI при первом запуске попытается установить и запустить её автоматически для текущего пользователя. Если установка не удалась, предупреждение подскажет проверить `kronbot service status`. Для установки из CLI выполните:
 
@@ -49,7 +49,6 @@ kronbot service install
 ```
 
 TUI и CLI предупреждают, если служба отсутствует, остановлена или использует другой каталог состояния. Остановка и удаление службы: `kronbot service stop` и `kronbot service uninstall`.
-После публикации пакета в PyPI установка из каталога проекта больше не понадобится: `pipx install kronbot`. До публикации используйте команду `pipx install .` выше.
 
 Перед первым **веб-входом** отдельно установите Chromium:
 
@@ -59,7 +58,7 @@ kronbot browser install
 
 Для веб-входа нужны графическая сессия и поддерживаемое Playwright окружение, позволяющее запустить Chromium с sandbox. При недостающих системных библиотеках Linux обратитесь к [инструкции Playwright](https://playwright.dev/python/docs/intro). Для входа с паролем или токеном Chromium и графический интерфейс не нужны.
 
-Перед обновлением или удалением инструмента остановите службу: `kronbot service stop`. После обновления исходников из корня проекта переустановите инструмент: `uv tool install --force .` или `pipx install --force .`, затем запустите службу через `kronbot service start`. Для полного удаления сначала выполните `kronbot service uninstall`, затем `uv tool uninstall kronbot` или `pipx uninstall kronbot`.
+Перед обновлением или удалением инструмента остановите службу: `kronbot service stop`. Обновите пакет командой `uv tool upgrade kronbot` или `pipx upgrade kronbot`, затем запустите службу через `kronbot service start`. Для полного удаления сначала выполните `kronbot service uninstall`, затем `uv tool uninstall kronbot` или `pipx uninstall kronbot`.
 
 ## Вход
 
@@ -143,6 +142,18 @@ kronbot browser install
 На POSIX состояние не шифруется: каталог `0700`, файлы `0600`. На Windows используется пользовательский DPAPI и проверка ACL; не запускайте программу администратором. Не публикуйте `state.json` и резервные копии: они содержат токены. Пароли, cookie и коды авторизации не сохраняются.
 
 ## Разработчикам
+
+Получите исходный код и перейдите в каталог проекта:
+
+```sh
+git clone https://github.com/citr00n/kronbot.git
+cd kronbot
+uv sync --locked
+```
+
+Запускайте версию из локального каталога через `uv run --locked kronbot` (TUI) или, например, `uv run --locked kronbot --help` (CLI). TUI также попытается установить фоновую службу; перед разработкой проверьте существующую службу через `kronbot service status`.
+
+Для установки локальной версии как инструмента используйте `uv tool install .` или `pipx install .` из корня проекта. Перед переустановкой остановите службу, после неё запустите снова.
 
 Источники контракта и поведения: [my-itmo-api](https://github.com/alllexey-dev/my-itmo-api) и [ITMO.Widgets Agent](https://github.com/alllexey-dev/itmo-widgets-agent). Сервер, pairing и push-события исходного агента не используются. Тесты не требуют аккаунта ИТМО:
 
