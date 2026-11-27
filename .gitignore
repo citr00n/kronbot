@@ -6,3 +6,4 @@ state.json
 kronbot.lock
 .state-*.tmp
 PLAN.md
+.DS_Store
