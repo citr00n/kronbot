@@ -3,7 +3,7 @@
 import asyncio
 import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -88,6 +88,25 @@ def forecast_identity(lesson):
         lesson.room_id, lesson.section_level, lesson.lesson_level,
         lesson.type_id, lesson.time_slot_id, lesson.starts_at, lesson.ends_at,
     )
+
+
+def forecast_prototypes(lessons, now):
+    """Вернуть реальные прототипы будущих, ещё отсутствующих занятий."""
+    identities = {identity for lesson in lessons if (identity := forecast_identity(lesson)) is not None}
+    targets = set()
+    result = []
+    for lesson in sorted(lessons, key=lambda item: (item.starts_at, item.id)):
+        identity = forecast_identity(lesson)
+        if identity is None or lesson.section_level != 1:
+            continue
+        target = identity[:-2] + (
+            identity[-2] + timedelta(days=14), identity[-1] + timedelta(days=14)
+        )
+        if target[-2].timestamp() <= now or target in identities or target in targets:
+            continue
+        targets.add(target)
+        result.append(lesson)
+    return result
 
 
 @dataclass(frozen=True)
