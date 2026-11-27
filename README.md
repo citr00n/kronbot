@@ -48,6 +48,8 @@ pipx install kronbot
 kronbot service install
 ```
 
+Если установленная служба не работает, выполните `kronbot doctor`: команда проверит состояние и попытается запустить службу для текущего каталога. Она не устанавливает отсутствующую службу и не снимает паузу или ограничения доступа; при проблемах покажет дальнейшие действия.
+
 TUI и CLI предупреждают, если служба отсутствует, остановлена или использует другой каталог состояния. Остановка и удаление службы: `kronbot service stop` и `kronbot service uninstall`.
 
 Перед первым **веб-входом** отдельно установите Chromium:
@@ -94,6 +96,7 @@ kronbot browser install
 
 | Команда | Действие |
 |---|---|
+| `kronbot doctor` | Проверить и восстановить установленную фоновую службу |
 | `kronbot schedule` | Свежее расписание |
 | `kronbot bookings` | Текущие и предстоящие записи My ITMO на ближайшие 365 дней |
 | `kronbot cancel [id]` | Подтвердить отписку от занятия в My ITMO |
@@ -164,7 +167,7 @@ uv run --locked playwright install chromium
 uv run --locked pytest -q tests/test_browser.py
 ```
 
-Linux CI запускается для push и pull request. Релизный workflow проверяет тег `vX.Y.Z` и версию в `pyproject.toml`, запускает CI, собирает пакет и публикует его в PyPI через Trusted Publishing, после чего создаёт GitHub Release. Перед первым релизом настройте в PyPI Trusted Publisher для этого репозитория, workflow `release.yml` и окружения GitHub `pypi`; создание тега запускает публикацию.
+CI запускается для PRов, но не после слияния в `main`. Релизный workflow отдельно вызывает CI, проверяет тег и версию в `pyproject.toml`, собирает пакет и публикует его в PyPI через Trusted Publishing, после чего создаёт GitHub Release. Стабильный тег — `vX.Y.Z`, alpha — `vX.Y.ZaN`, dev — `vX.Y.Z.devN`; alpha и dev отмечаются на GitHub как prerelease.
 
 ## Лицензия
 

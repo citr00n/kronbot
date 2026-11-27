@@ -3,6 +3,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -297,3 +298,128 @@ def test_running_service_requires_running_and_matching_directory(monkeypatch, tm
     monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(
         status=lambda: status, configured_state_dir=lambda: path))
     assert cli._service_running(current) is expected
+
+
+@pytest.mark.parametrize(("initial", "target", "paused", "blocked", "after", "code", "starts"), [
+    ("not installed", "current", False, False, "running", 1, 0),
+    ("stopped", "other", False, False, "running", 1, 0),
+    ("running", "current", False, False, "running", 0, 0),
+    ("stopped", "current", True, False, "running", 3, 0),
+    ("stopped", "current", False, True, "running", 3, 0),
+    ("stopped", "current", False, False, "running", 0, 1),
+    ("stopped", "current", False, False, "stopped", 1, 1),
+])
+def test_doctor_service_safety(monkeypatch, tmp_path, capsys, initial, target, paused, blocked, after, code, starts):
+    from types import SimpleNamespace
+    from kronbot import cli
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["background_paused"] = paused
+        if blocked:
+            store.data["blocked_until"]["my.itmo.ru"] = int(time.time()) + 3600
+        store.save()
+    calls = []
+    manager = SimpleNamespace(
+        status=lambda: after if calls else initial,
+        configured_state_dir=lambda: directory if target == "current" else tmp_path / "other",
+        start=lambda: calls.append("start"),
+    )
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    monkeypatch.setattr(cli, "state_directory", lambda: directory)
+    clock = iter((0, 3))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock, 3))
+    assert cli._doctor() == code
+    assert len(calls) == starts
+    output = capsys.readouterr()
+    if initial == "not installed":
+        assert "kronbot service install" in output.out
+    if starts and after == "stopped":
+        assert "не запустилась" in output.err
+        assert "служба запущена" not in output.out.lower()
+    with StateStore(directory) as store:
+        assert store.data["background_paused"] == paused
+        assert bool(store.data["blocked_until"]) == blocked
+
+
+def test_doctor_locked_state_never_starts(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+    from kronbot import cli
+
+    directory = tmp_path / "state"
+    calls = []
+    manager = SimpleNamespace(status=lambda: "stopped", configured_state_dir=lambda: directory,
+                              start=lambda: calls.append(True))
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    monkeypatch.setattr(cli, "state_directory", lambda: directory)
+    with StateStore(directory):
+        assert cli._doctor() == 1
+    assert not calls
+    assert "занято" in capsys.readouterr().err
+
+
+def test_doctor_start_failure_never_reports_success(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+    from kronbot import cli
+
+    directory = tmp_path / "state"
+    def fail():
+        raise RuntimeError("secret")
+    manager = SimpleNamespace(status=lambda: "stopped", configured_state_dir=lambda: directory, start=fail)
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    monkeypatch.setattr(cli, "state_directory", lambda: directory)
+    assert cli._doctor() == 1
+    output = capsys.readouterr()
+    assert "secret" not in output.err
+    assert "служба запущена" not in output.out.lower()
+    assert "kronbot service install" in output.err
+
+
+@pytest.mark.parametrize(("argv", "tty", "expected"), [
+    (["doctor"], True, True),
+    (["doctor"], False, False),
+    (["browser", "install"], True, False),
+    (["service", "run", "--state-dir", "/tmp/state"], True, False),
+    (["book", "1"], True, False),
+    (["watch"], True, False),
+    (["--help"], True, False),
+])
+def test_update_check_only_interactive_cli(monkeypatch, capsys, argv, tty, expected):
+    from types import SimpleNamespace
+    from kronbot import cli
+
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["kronbot", *argv])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: tty)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: tty)
+    monkeypatch.setattr(cli, "check_update", lambda: calls.append(True) or "Доступно обновление")
+    monkeypatch.setattr(cli, "_doctor", lambda: 0)
+    monkeypatch.setattr(cli, "_service_command", lambda args: 0)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(cli, "_service_notice", lambda *args, **kwargs: "")
+    class Store:
+        data = {"background_paused": False}
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    monkeypatch.setattr(cli, "StateStore", Store)
+    async def run(*args):
+        return 0
+    monkeypatch.setattr(cli, "_run", run)
+    if argv == ["--help"]:
+        with pytest.raises(SystemExit):
+            cli.main()
+    else:
+        assert cli.main() == 0
+    assert bool(calls) is expected
+    assert ("Доступно обновление" in capsys.readouterr().err) is expected
+
+
+def test_update_checker_failure_is_silent(monkeypatch, capsys):
+    from kronbot import cli
+    def fail():
+        raise OSError("secret")
+    monkeypatch.setattr(cli, "check_update", fail)
+    cli._interactive_update_notice()
+    assert not capsys.readouterr().err
