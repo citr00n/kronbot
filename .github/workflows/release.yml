@@ -79,7 +79,7 @@ jobs:
           directory = Path('dist')
           wheel = directory / f'kronbot-{version}-py3-none-any.whl'
           sdist = directory / f'kronbot-{version}.tar.gz'
-          if set(directory.iterdir()) != {wheel, sdist}:
+          if {path for path in directory.iterdir() if path.name != '.gitignore'} != {wheel, sdist}:
               raise SystemExit('Unexpected distribution files')
           with zipfile.ZipFile(wheel) as archive:
               wheel_metadata = archive.read(f'kronbot-{version}.dist-info/METADATA')
