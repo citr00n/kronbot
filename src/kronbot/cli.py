@@ -12,14 +12,15 @@ import time
 import threading
 import warnings
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .agent import Agent, MSK, QueueError
 from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
-from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
+from .login_guides import LOGIN_GUIDE
+from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text, forecast_prototypes
 from .state import StateError, StateLocked, StateStore, state_directory
 from .updates import check_update
 
@@ -128,8 +129,7 @@ def _text_login(method):
         except (EOFError, OSError):
             raise ValueError("Не удалось прочитать логин.") from None
         return username, _secret("Пароль: ")
-    if method == "refresh-token":
-        print("При обмене старый refresh-токен инвалидируется; не делите его с другим клиентом.", file=sys.stderr)
+    print(LOGIN_GUIDE["refresh" if method == "refresh-token" else "access"], file=sys.stderr)
     return "", _secret("Токен: ")
 
 
@@ -279,6 +279,13 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
                 warning = "  Пересечение с расписанием" if lesson.intersection else ""
                 allowed = "да" if lesson.can_sign_in else "нет"
                 print(f"{lesson.id}  {date_text}  {lesson.section_name}  {lesson.room_name}  {lesson.available}  Запись: {allowed}{warning}")
+            for lesson in forecast_prototypes(agent.snapshot, now()):
+                target = (lesson.starts_at + timedelta(days=14)).astimezone(MSK)
+                date_text = target.strftime("%d.%m.%Y %H:%M")
+                print(
+                    f"~ {lesson.id}  {date_text}  {clean_text(lesson.section_name)}  "
+                    f"{clean_text(lesson.room_name)}  прогноз (ID прототипа; queue forecast {lesson.id})"
+                )
         else:
             lesson = next((x for x in agent.snapshot if x.id == args.id), None)
             if lesson is None:

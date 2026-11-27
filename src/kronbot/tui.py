@@ -16,7 +16,8 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sel
 from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
-from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
+from .login_guides import LOGIN_GUIDE
+from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text, forecast_prototypes
 from .state import StateError, StateLocked, StateStore
 from .updates import check_update
 
@@ -43,28 +44,6 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-LOGIN_GUIDE = {
-    "browser": (
-        "1. Выйдите из TUI и выполните: kronbot browser install\n"
-        "2. Нужны графическая сессия и работающий sandbox.\n"
-        "3. Вернитесь в TUI, нажмите «Войти» и войдите в отдельном Chromium."
-    ),
-    "password": (
-        "1. Введите логин ИТМО и пароль ниже.\n"
-        "2. Пароль скрыт при вводе; нажмите Enter или «Войти».\n"
-        "3. Если нужен дополнительный шаг, используйте веб-вход."
-    ),
-    "refresh": (
-        "1. Вставьте только свой refresh-токен My ITMO в скрытое поле.\n"
-        "2. Нажмите Enter или «Войти»: токен будет обменян и ротирован.\n"
-        "Исходная сессия может перестать работать; не делите токен."
-    ),
-    "access": (
-        "1. Вставьте только свой access-токен My ITMO в скрытое поле.\n"
-        "2. Нажмите Enter или «Войти».\n"
-        "Access-токен не продлевается автоматически; затем нужен новый вход."
-    ),
-}
 
 
 class LoginScreen(ModalScreen):
@@ -359,23 +338,31 @@ class KronbotApp(App):
         scroll = (table.scroll_x, table.scroll_y)
         selected = self.hidden_schedule_selection or self._selected(table) or self.schedule_selection
         table.clear()
-        visible = [lesson for lesson in self.agent.snapshot if self._matches_filters(lesson)]
-        visible_ids = {str(lesson.id) for lesson in visible}
+        forecasts = forecast_prototypes(self.agent.snapshot, self.now())
+        visible = [(lesson, False) for lesson in self.agent.snapshot if self._matches_filters(lesson)]
+        visible += [(lesson, True) for lesson in forecasts if self._matches_filters(lesson, forecast=True)]
+        visible_ids = {f"forecast:{lesson.id}" if forecast else str(lesson.id) for lesson, forecast in visible}
         self.hidden_schedule_selection = selected if selected and selected not in visible_ids else None
-        for lesson in visible:
-            queued = [x for x in queue if x["lesson_id"] == lesson.id]
-            availability = "Да" if lesson.can_sign_in else "Нет"
-            if lesson.intersection:
+        for lesson, forecast in visible:
+            queued = [
+                x for x in queue
+                if (x.get("forecast", {}).get("prototype_lesson_id") == lesson.id
+                    if forecast else x["lesson_id"] == lesson.id and not (
+                        x.get("forecast") and not x["forecast"]["bound"]))
+            ]
+            availability = "Неизвестно" if forecast else ("Да" if lesson.can_sign_in else "Нет")
+            if not forecast and lesson.intersection:
                 availability += "; Пересечение с расписанием"
+            starts_at = lesson.starts_at + timedelta(days=14) if forecast else lesson.starts_at
             table.add_row(
-                Text(str(lesson.id)),
-                Text(lesson.starts_at.astimezone(MSK).strftime("%d.%m %H:%M")),
-                Text(clean_text(lesson.section_name)),
+                Text(f"~{lesson.id} (прототип)" if forecast else str(lesson.id)),
+                Text(starts_at.astimezone(MSK).strftime("%d.%m %H:%M")),
+                Text(("Прогноз: " if forecast else "") + clean_text(lesson.section_name)),
                 Text(clean_text(lesson.room_name)),
-                Text(str(lesson.available)),
+                Text("Неизвестно" if forecast else str(lesson.available)),
                 Text(availability),
                 Text("; ".join(STATUSES[x["status"]] + (" (прогноз)" if x.get("forecast") is not None else "") for x in queued)),
-                key=str(lesson.id),
+                key=f"forecast:{lesson.id}" if forecast else str(lesson.id),
             )
         if not visible:
             table.add_row(
@@ -432,19 +419,20 @@ class KronbotApp(App):
         self._restore(table, selected)
         table.call_after_refresh(table.scroll_to, *scroll, animate=False)
 
-    def _matches_filters(self, lesson):
+    def _matches_filters(self, lesson, *, forecast=False):
         search = self.query_one("#filter-search", Input).value.strip().casefold()
         sport_type = self.query_one("#filter-type", Select).value
         sign = self.query_one("#filter-sign", Select).value
         places = self.query_one("#filter-places", Select).value
         period = self.query_one("#filter-time", Select).value
-        hour = lesson.starts_at.astimezone(MSK).hour
+        starts_at = lesson.starts_at + timedelta(days=14) if forecast else lesson.starts_at
+        hour = starts_at.astimezone(MSK).hour
         return (
             (not search or search in clean_text(lesson.section_name).casefold()
              or search in clean_text(lesson.room_name).casefold())
             and (sport_type == "all" or self.filter_ids is not None and lesson.id in self.filter_ids)
-            and (sign == "all" or (sign == "yes") == lesson.can_sign_in)
-            and (places == "all" or (places == "yes") == (lesson.available > 0))
+            and (sign == "all" or not forecast and (sign == "yes") == lesson.can_sign_in)
+            and (places == "all" or not forecast and (places == "yes") == (lesson.available > 0))
             and (period == "all" or period == "morning" and hour < 12
                  or period == "day" and 12 <= hour < 18
                  or period == "evening" and hour >= 18)
@@ -820,7 +808,9 @@ class KronbotApp(App):
         try:
             if self.stale or self.filter_stale:
                 raise QueueError("Расписание устарело. Обновите его.")
-            lesson = next((x for x in self.agent.snapshot if str(x.id) == key and self._matches_filters(x)), None)
+            is_forecast = key.startswith("forecast:")
+            candidates = forecast_prototypes(self.agent.snapshot, self.now()) if is_forecast else self.agent.snapshot
+            lesson = next((x for x in candidates if (f"forecast:{x.id}" if is_forecast else str(x.id)) == key and self._matches_filters(x, forecast=is_forecast)), None)
             if lesson is None:
                 raise QueueError("Занятие не найдено в актуальном расписании.")
             self.agent.add_forecast(lesson)
@@ -839,13 +829,19 @@ class KronbotApp(App):
             return
         if event.data_table.id == "schedule":
             try:
-                lesson = next((x for x in self.agent.snapshot if x.id == int(key) and self._matches_filters(x)), None)
+                is_forecast = key.startswith("forecast:")
+                candidates = forecast_prototypes(self.agent.snapshot, self.now()) if is_forecast else self.agent.snapshot
+                lesson = next((x for x in candidates if (f"forecast:{x.id}" if is_forecast else str(x.id)) == key and self._matches_filters(x, forecast=is_forecast)), None)
                 if lesson is None:
-                    return
+                    raise QueueError("Занятие не найдено в актуальном расписании.")
                 if self.stale or self.filter_stale:
                     raise QueueError("Расписание устарело. Обновите его.")
-                self.agent.add(lesson)
-                self.error = ""
+                if is_forecast:
+                    self.agent.add_forecast(lesson)
+                    self.error = "Прогноз занятия добавлен в очередь."
+                else:
+                    self.agent.add(lesson)
+                    self.error = ""
             except (QueueError, LoginRequired, StateError) as exc:
                 self.error = str(exc)
             self._render()

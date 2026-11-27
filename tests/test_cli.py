@@ -138,6 +138,31 @@ def test_guided_login_selection(monkeypatch, capsys):
     assert "инвалидирован" in output and "не продлевается" in output
 
 
+@pytest.mark.parametrize(
+    ("method", "cookie"),
+    [("refresh-token", "auth.refresh_token.itmoId"), ("access-token", "auth._token.itmoId")],
+)
+def test_token_login_guidance_before_hidden_input(monkeypatch, capsys, method, cookie):
+    from kronbot import cli
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    def secret(prompt):
+        guide = capsys.readouterr().err
+        assert cookie in guide and "F12" in guide and "Application" in guide
+        assert "Cookies" in guide and "https://my.itmo.ru" in guide
+        assert "секрет" in guide and "Если cookie нет" in guide
+        if method == "refresh-token":
+            assert "ротирует" in guide and "сессию" in guide
+        else:
+            assert "Bearer%20" in guide and "KEYCLOAK_IDENTITY" in guide
+        return "synthetic-secret"
+    monkeypatch.setattr(cli, "_secret", secret)
+    assert cli._text_login(method) == ("", "synthetic-secret")
+    captured = capsys.readouterr()
+    assert "synthetic-secret" not in captured.out + captured.err
+
+
 def test_browser_install_uses_current_environment(monkeypatch):
     from types import SimpleNamespace
     from kronbot import cli
@@ -253,16 +278,38 @@ async def test_queue_forecast_and_disambiguated_removal(tmp_path, capsys):
         "lesson_level": 1, "building_id": 2, "room_id": 3,
         "time_slot_id": 4, "teacher_isu": 5,
     }
+    lessons = [lesson]
     def handler(request):
         assert request.method == "GET"
         if request.url.path.endswith("/sign/schedule"):
-            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [lesson]}]})
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": lessons}]})
         return httpx.Response(200, json={"error_code": 0, "result": []})
     with StateStore(tmp_path / "state") as store:
         store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
         client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
         async def run(*argv):
             return await execute(parser().parse_args(list(argv)), store, client, now=lambda: now)
+        assert await run("schedule") == 0
+        output = capsys.readouterr().out.splitlines()
+        assert len(output) == 2
+        assert output[0].startswith("10  ") and output[1].startswith("~ 10  ")
+        assert (start + timedelta(days=14)).astimezone(
+            timezone(timedelta(hours=3))
+        ).strftime("%d.%m.%Y %H:%M") in output[1]
+        assert "прогноз" in output[1] and "ID прототипа" in output[1]
+        assert not store.data["queues"].get("owner")
+        target = {
+            **lesson,
+            "id": 11,
+            "date": (start + timedelta(days=14)).isoformat(),
+            "date_end": (start + timedelta(days=14, hours=1)).isoformat(),
+        }
+        lessons.append(target)
+        assert await run("schedule") == 0
+        output = capsys.readouterr().out.splitlines()
+        assert any(line.startswith("11  ") for line in output)
+        assert not any(line.startswith("~ 10  ") for line in output)
+        lessons.pop()
         assert await run("queue", "add", "10") == 0
         assert await run("queue", "forecast", "10") == 0
         queue = store.data["queues"]["owner"]
