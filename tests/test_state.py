@@ -93,3 +93,33 @@ def test_invalid_stored_isu_is_rejected(tmp_path, isu):
         }
         with pytest.raises(StateError):
             store.save()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("prototype_lesson_id", 0),
+    ("section_id", None),
+    ("teacher_isu", True),
+    ("room_id", 0),
+    ("type_id", 5),
+    ("bound", "yes"),
+    ("predicted_ends_at", "2030-01-15T11:31:00+03:00"),
+])
+def test_invalid_forecast_state_is_rejected(tmp_path, field, value):
+    forecast = {
+        "bound": False, "prototype_lesson_id": 1, "section_id": 31,
+        "teacher_isu": 200002, "building_id": 13, "room_id": 1001,
+        "section_level": 1, "lesson_level": 1, "type_id": 2, "time_slot_id": 2,
+        "prototype_starts_at": "2030-01-01T10:00:00+03:00",
+        "prototype_ends_at": "2030-01-01T11:30:00+03:00",
+        "predicted_ends_at": "2030-01-15T11:30:00+03:00",
+        "teacher_name": "Тренер", "room_name": "Зал",
+    }
+    forecast[field] = value
+    with StateStore(tmp_path / "state") as store:
+        store.data["queues"]["owner"] = [{
+            "lesson_id": 1, "section_name": "Секция",
+            "starts_at": "2030-01-15T10:00:00+03:00", "status": "waiting",
+            "refusal_code": None, "forecast": forecast,
+        }]
+        with pytest.raises(StateError):
+            store.save()

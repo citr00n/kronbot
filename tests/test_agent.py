@@ -264,3 +264,399 @@ async def test_confirmation_save_failure_restores_uncertain_entry(tmp_path, monk
         assert agent.queue()[0]["status"] == "uncertain"
         assert agent.confirmed_ids == set()
         await sport.close()
+
+
+def _forecast_row(ident, starts):
+    return {
+        "id": ident, "date": starts.isoformat(),
+        "date_end": (starts + timedelta(minutes=90)).isoformat(),
+        "section_id": 31, "section_name": "Тестовая секция", "section_level": 1,
+        "lesson_level": 1, "type_id": 2, "building_id": 13, "room_id": 1001,
+        "room_name": "Спортзал 1", "time_slot_id": 2, "teacher_isu": 200002,
+        "teacher_fio": "Тренер Тестовый", "available": 1, "signed": False,
+        "can_sign_in": {"can_sign_in": True},
+    }
+
+
+def _session(now):
+    return {"sub": "owner", "access_token": "access", "access_expires_at": now + 100000,
+            "refresh_token": None, "refresh_expires_at": None}
+
+
+async def test_forecast_survives_restart_binds_and_books(tmp_path):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    prototype = datetime.fromtimestamp(now - 86400, timezone.utc)
+    rows = [_forecast_row(10, prototype)]
+    posts = []
+
+    def handler(request):
+        if request.method == "POST":
+            posts.append(request.content)
+            return httpx.Response(200, json={"error_code": 0, "result": [20]})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": rows}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0,
+            "result": {"free_attempts": 1, "can_sign_in": True}})
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        agent.add_forecast(_lesson(rows[0]))
+        await agent.check(allow_booking=True)
+        assert agent.queue()[0]["lesson_id"] == 10
+        assert agent.queue()[0]["status"] == "waiting"
+        assert not posts
+        await sport.close()
+    rows[:] = [_forecast_row(20, prototype + timedelta(days=14))]
+    with StateStore(directory) as store:
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        await agent.check(allow_booking=False)
+        assert agent.queue()[0]["lesson_id"] == 20
+        assert agent.queue()[0]["forecast"]["bound"]
+        await sport.close()
+    with StateStore(directory) as store:
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        await agent.check(allow_booking=True)
+        assert posts == [b"[20]"]
+        assert agent.queue() == []
+        await sport.close()
+
+
+@pytest.mark.parametrize("key,value", [
+    ("section_id", 32), ("teacher_isu", 200003), ("building_id", 14),
+    ("room_id", 1002), ("section_level", 2), ("lesson_level", 2),
+    ("type_id", 5), ("time_slot_id", 3),
+    ("date", "2030-01-01T10:01:00+00:00"),
+    ("date_end", "2030-01-01T11:31:00+00:00"),
+])
+def test_forecast_rejects_each_mismatched_field(tmp_path, key, value):
+    from kronbot.sport import _lesson
+    now = 1893456000
+    prototype = datetime(2029, 12, 18, 10, tzinfo=timezone.utc)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        agent = Agent(store, None, now=lambda: now)
+        agent.add_forecast(_lesson(_forecast_row(10, prototype)))
+        real = _forecast_row(20, prototype + timedelta(days=14))
+        real[key] = value
+        candidate = _lesson(real)
+        assert candidate is None or not agent._matches_forecast(agent.queue()[0], candidate)
+
+
+@pytest.mark.parametrize("change", [
+    {"section_id": None}, {"teacher_isu": 0}, {"lesson_level": None},
+    {"time_slot_id": None}, {"date_end": None}, {"type_id": 5},
+    {"building_id": 0}, {"room_id": 0}, {"building_id": None, "room_id": 1001},
+    {"building_id": 13, "room_id": -1},
+])
+def test_forecast_refuses_unprovable_prototypes(tmp_path, change):
+    from kronbot.agent import QueueError
+    from kronbot.sport import _lesson
+    now = 1900000000
+    row = _forecast_row(10, datetime.fromtimestamp(now, timezone.utc))
+    row.update(change)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        agent = Agent(store, None, now=lambda: now)
+        lesson = _lesson(row)
+        if lesson is not None:
+            with pytest.raises(QueueError):
+                agent.add_forecast(lesson)
+        assert agent.queue() == []
+
+
+def test_forecast_ambiguous_online_and_existing_uncertain(tmp_path):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    prototype = datetime.fromtimestamp(now, timezone.utc)
+    row = _forecast_row(10, prototype)
+    row.update(building_id=None, room_id=-1)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        agent = Agent(store, None, now=lambda: now)
+        agent.add_forecast(_lesson(row))
+        real = _forecast_row(20, prototype + timedelta(days=14))
+        real.update(building_id=-1, room_id=-1)
+        candidate = _lesson(real)
+        duplicate = _lesson({**real, "id": 21})
+        agent._bind_forecasts(agent.queue(), [candidate, duplicate])
+        assert agent.queue()[0]["lesson_id"] == 10
+        agent.queue().append({"lesson_id": 20, "section_name": "Секция",
+                              "starts_at": real["date"], "status": "uncertain",
+                              "refusal_code": None})
+        store.save()
+        agent._bind_forecasts(agent.queue(), [candidate])
+        assert len(agent.queue()) == 1
+        assert agent.queue()[0]["status"] == "uncertain"
+        assert agent.queue()[0]["lesson_id"] == 20
+
+
+@pytest.mark.parametrize("status", ["rejected", "expired"])
+def test_forecast_retained_when_matching_terminal_entry(tmp_path, status):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    prototype = datetime.fromtimestamp(now, timezone.utc)
+    real = _forecast_row(20, prototype + timedelta(days=14))
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = _session(now)
+        agent = Agent(store, None, now=lambda: now)
+        agent.add_forecast(_lesson(_forecast_row(10, prototype)))
+        agent.queue().append({
+            "lesson_id": 20, "section_name": "Секция", "starts_at": real["date"],
+            "status": status, "refusal_code": 137 if status == "rejected" else None,
+        })
+        store.save()
+        agent._bind_forecasts(agent.queue(), [_lesson(real)])
+        assert len(agent.queue()) == 2
+        assert agent.queue()[0]["lesson_id"] == 10
+        assert agent.queue()[0]["forecast"]["bound"] is False
+        assert agent.queue()[1]["status"] == status
+    with StateStore(directory) as store:
+        agent = Agent(store, None, now=lambda: now)
+        assert len(agent.queue()) == 2
+        agent.queue().pop()
+        store.save()
+        agent._bind_forecasts(agent.queue(), [_lesson(real)])
+        assert agent.queue()[0]["lesson_id"] == 20
+        assert agent.queue()[0]["forecast"]["bound"] is True
+
+
+async def test_multiple_candidates_post_without_interval_and_preserve_refusal(tmp_path):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    starts = datetime.fromtimestamp(now + 86400, timezone.utc)
+    rows = [_forecast_row(ident, starts) for ident in (1, 2, 3)]
+    posts = []
+
+    def handler(request):
+        if request.method == "POST":
+            posts.append(request.content)
+            if request.content == b"[1]":
+                return httpx.Response(200, json={"error_code": 137, "result": None})
+            ident = int(request.content[1:-1])
+            return httpx.Response(200, json={"error_code": 0, "result": [ident]})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": rows}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0,
+            "result": {"free_attempts": 1, "can_sign_in": True}})
+
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        for row in rows:
+            agent.add(_lesson(row))
+        await agent.check(allow_booking=True)
+        assert posts == [b"[1]", b"[2]", b"[3]"]
+        assert [(x["lesson_id"], x["status"], x["refusal_code"]) for x in agent.queue()] == [(1, "rejected", 137)]
+        assert len(store.data["sport_request_times"]) == 8
+        await sport.close()
+
+
+def test_forecast_binding_save_failure_restores_queue(tmp_path, monkeypatch):
+    from kronbot.sport import _lesson
+    from kronbot.state import StateError
+    now = 1900000000
+    prototype = datetime.fromtimestamp(now, timezone.utc)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        agent = Agent(store, None, now=lambda: now)
+        agent.add_forecast(_lesson(_forecast_row(10, prototype)))
+        real = _lesson(_forecast_row(20, prototype + timedelta(days=14)))
+        def fail():
+            raise StateError("synthetic")
+        monkeypatch.setattr(store, "save", fail)
+        with pytest.raises(StateError):
+            agent._bind_forecasts(agent.queue(), [real])
+        assert agent.queue()[0]["lesson_id"] == 10
+        assert agent.queue()[0]["forecast"]["bound"] is False
+
+
+async def test_booking_prototype_does_not_consume_its_forecast(tmp_path):
+    from kronbot.agent import QueueError
+    from kronbot.sport import _lesson
+    now = 1900000000
+    start = datetime.fromtimestamp(now + 86400, timezone.utc)
+    row = _forecast_row(10, start)
+    posts = []
+
+    def handler(request):
+        if request.method == "POST":
+            posts.append(request.content)
+            return httpx.Response(200, json={"error_code": 0, "result": [10]})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [row]}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0,
+            "result": {"free_attempts": 1, "can_sign_in": True}})
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        lesson = _lesson(row)
+        agent.add_forecast(lesson)
+        agent.add(lesson)
+        with pytest.raises(QueueError):
+            agent.remove(10)
+        await agent.check(allow_booking=True, only_lesson_id=10)
+        assert posts == [b"[10]"]
+        assert len(agent.queue()) == 1
+        assert agent.queue()[0]["forecast"]["bound"] is False
+        await sport.close()
+    with StateStore(directory) as store:
+        assert store.data["queues"]["owner"][0]["lesson_id"] == 10
+        assert store.data["queues"]["owner"][0]["forecast"]["bound"] is False
+
+
+@pytest.mark.parametrize("response", [[], [1, 2], [1, 1], [True], None])
+async def test_ambiguous_post_result_stays_uncertain(tmp_path, response):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    row = _forecast_row(1, datetime.fromtimestamp(now + 86400, timezone.utc))
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"error_code": 0, "result": response})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [row]}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0,
+            "result": {"free_attempts": 1, "can_sign_in": True}})
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        agent.add(_lesson(row))
+        await agent.check(allow_booking=True)
+        assert agent.queue()[0]["status"] == "uncertain"
+        await sport.close()
+    with StateStore(directory) as store:
+        assert store.data["queues"]["owner"][0]["status"] == "uncertain"
+
+
+async def test_incomplete_or_duplicate_snapshot_blocks_forecast_matching(tmp_path):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    start = datetime.fromtimestamp(now, timezone.utc)
+    real = _forecast_row(20, start + timedelta(days=14))
+    other = {**real, "id": 21}
+    rows = [real, other, dict(other)]
+    def handler(request):
+        return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": rows}]})
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        agent.add_forecast(_lesson(_forecast_row(10, start)))
+        await agent.check(allow_booking=False)
+        assert agent.queue()[0]["forecast"]["bound"] is False
+        rows[:] = [real, {**other, "teacher_isu": None}]
+        await agent.check(allow_booking=False)
+        assert agent.queue()[0]["forecast"]["bound"] is False
+        await sport.close()
+
+
+async def test_attempts_are_rechecked_after_each_success(tmp_path):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    starts = datetime.fromtimestamp(now + 86400, timezone.utc)
+    rows = [_forecast_row(ident, starts) for ident in (1, 2)]
+    posts = []
+    def handler(request):
+        if request.method == "POST":
+            posts.append(request.content)
+            return httpx.Response(200, json={"error_code": 0, "result": [1]})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": rows}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0,
+            "result": {"free_attempts": 0 if posts else 1, "can_sign_in": True}})
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        for row in rows:
+            agent.add(_lesson(row))
+        await agent.check(allow_booking=True)
+        assert posts == [b"[1]"]
+        assert [(x["lesson_id"], x["status"]) for x in agent.queue()] == [(2, "waiting")]
+        await sport.close()
+
+
+async def test_failed_result_save_keeps_uncertain_in_memory_and_on_disk(tmp_path, monkeypatch):
+    from kronbot.sport import _lesson
+    from kronbot.state import StateError
+    now = 1900000000
+    row = _forecast_row(1, datetime.fromtimestamp(now + 86400, timezone.utc))
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"error_code": 135, "result": None})
+        if request.url.path.endswith("/sign/schedule"):
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [row]}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0,
+            "result": {"free_attempts": 1, "can_sign_in": True}})
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        agent.add(_lesson(row))
+        save = store.save
+        reserved = False
+        def fail_after_post():
+            nonlocal reserved
+            item = store.data["queues"]["owner"][0]
+            if item["status"] == "uncertain":
+                reserved = True
+            elif reserved:
+                raise StateError("synthetic")
+            save()
+        monkeypatch.setattr(store, "save", fail_after_post)
+        with pytest.raises(StateError):
+            await agent.check(allow_booking=True)
+        assert agent.queue()[0]["status"] == "uncertain"
+        await sport.close()
+    with StateStore(directory) as store:
+        assert store.data["queues"]["owner"][0]["status"] == "uncertain"
+
+
+async def test_cancel_booking_preserves_same_id_forecast(tmp_path):
+    from kronbot.sport import _lesson
+    now = 1900000000
+    row = _forecast_row(10, datetime.fromtimestamp(now + 86400, timezone.utc))
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"error_code": 0, "result": [10]})
+        return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [row]}]})
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = _session(now)
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        agent.add_forecast(_lesson(row))
+        agent.add(_lesson(row))
+        booking = (await agent.bookings())[0]
+        await agent.cancel_booking(booking)
+        assert len(agent.queue()) == 1
+        assert agent.queue()[0]["forecast"]["bound"] is False
+        await sport.close()
+    with StateStore(directory) as store:
+        assert len(store.data["queues"]["owner"]) == 1
+        assert store.data["queues"]["owner"][0]["forecast"]["bound"] is False

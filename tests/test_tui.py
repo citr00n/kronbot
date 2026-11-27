@@ -301,9 +301,11 @@ def test_tui_run_installs_service_before_opening_app(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setenv("KRONBOT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(cli, "_service_notice", lambda path, *, install: calls.append((path, install)) or "Служба недоступна")
+    monkeypatch.setattr(cli, "_service_running", lambda path: False)
     class FakeApp:
-        def __init__(self, store, *, service_notice):
+        def __init__(self, store, *, service_notice, service_active, service_probe):
             assert service_notice == "Служба недоступна"
+            assert not service_active and not service_probe()
         def run(self):
             calls.append("ui")
     monkeypatch.setattr(tui, "KronbotApp", FakeApp)
@@ -511,4 +513,228 @@ async def test_sport_filter_ignores_outdated_response(tmp_path):
             assert app.agent.snapshot == [first, second]
             assert app.filter_ids == {2}
             assert app._selected(app.query_one("#schedule", DataTable)) == "2"
+        await app.sport.close()
+
+
+async def test_forecast_key_adds_future_lesson_and_reports_invalid(tmp_path):
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+    from kronbot.sport import Lesson
+
+    now = 1900000000
+    starts = datetime.fromtimestamp(now + 86400, timezone.utc)
+    lesson = Lesson(10, "Бег", "Зал", starts, 1, 2, 1, False, False, True,
+                    section_id=1, lesson_level=1, building_id=1, room_id=2,
+                    time_slot_id=3, teacher_isu=4, ends_at=starts + timedelta(hours=1))
+    invalid = Lesson(11, "Плавание", "Зал", starts, 1, 2, 1, False, False, True)
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.sport.sport_types = AsyncMock(return_value=[])
+        app.sport.account_isu = AsyncMock(return_value=None)
+        async def refresh(*, allow_booking):
+            app.agent.snapshot = [lesson, invalid]
+        app.agent.check = AsyncMock(side_effect=refresh)
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#schedule", DataTable)
+            table.focus()
+            await pilot.press("f")
+            item = app.agent.queue()[0]
+            assert item["forecast"]["bound"] is False
+            assert datetime.fromisoformat(item["starts_at"]) == starts + timedelta(days=14)
+            assert "прогноз" in str(app.query_one("#queue", DataTable).get_row("10:forecast")[-1]).lower()
+            await pilot.press("enter")
+            queue = app.query_one("#queue", DataTable)
+            assert queue.row_count == 2
+            assert queue.get_row("10:lesson") and queue.get_row("10:forecast")
+            from textual.widgets import TabbedContent
+            tabs = app.query_one(TabbedContent)
+            tabs.active = "queue-tab"
+            await pilot.pause()
+            queue.move_cursor(row=queue.get_row_index("10:lesson"))
+            app.action_remove()
+            assert len(app.agent.queue()) == 1 and app.agent.queue()[0].get("forecast")
+            tabs.active = "schedule-tab"
+            await pilot.pause()
+            table.focus()
+            table.move_cursor(row=1)
+            await pilot.press("f")
+            assert "нельзя создать" in app.error
+            assert len(app.agent.queue()) == 1
+            app._remove("10:forecast", True)
+            assert not app.agent.queue()
+        await app.sport.close()
+
+
+async def test_running_service_handoff_pause_and_stopping(tmp_path):
+    from unittest.mock import AsyncMock
+    from kronbot.agent import MSK
+
+    now = int(datetime(2030, 3, 20, 12, tzinfo=MSK).timestamp())
+    clock = {"wall": now, "mono": 0}
+    running = {"value": True}
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Бег", "starts_at": datetime.fromtimestamp(now + 86400, timezone.utc).isoformat(), "status": "waiting", "refusal_code": None}]
+        app = KronbotApp(store, now=lambda: clock["wall"], monotonic=lambda: clock["mono"],
+                         service_active=True, service_probe=lambda: running["value"])
+        app.sport.sport_types = AsyncMock(return_value=[])
+        app.sport.account_isu = AsyncMock(return_value=None)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause(0.7)
+            assert app.auto
+            assert any(call.kwargs["allow_booking"] for call in app.agent.check.await_args_list)
+            app.action_pause()
+            assert not app.auto and store.data["background_paused"]
+            app.action_pause()
+            assert app.auto and not store.data["background_paused"]
+            running["value"] = False
+            clock["mono"] += 1
+            app._tick()
+            await app.service_probe_task
+            assert not app.auto and not app.agent.booking_enabled
+            assert "остановлена" in app.service_notice
+        await app.sport.close()
+
+
+async def test_service_pause_survives_login_and_requires_explicit_resume(tmp_path):
+    from unittest.mock import AsyncMock
+    from kronbot.sport import NetworkBlocked
+
+    now = 1900000000
+    clock = {"wall": now}
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: clock["wall"], service_active=True)
+        app.sport.sport_types = AsyncMock(return_value=[])
+        app.sport.account_isu = AsyncMock(return_value=None)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            store.data["blocked_until"]["my.itmo.ru"] = now + 120
+            app._stop_for_error(NetworkBlocked(now + 120))
+            assert store.data["background_paused"] and not app.auto
+            app.action_login()
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not app.auto and store.data["background_paused"]
+            app.action_pause()
+            assert not app.auto and store.data["background_paused"]
+            clock["wall"] += 121
+            await pilot.pause()
+            assert not app.auto
+            app.action_pause()
+            assert app.auto and not store.data["background_paused"]
+        await app.sport.close()
+
+
+async def test_service_pause_during_refresh_prevents_post(tmp_path):
+    from unittest.mock import AsyncMock
+    from kronbot.agent import MSK
+
+    now = int(datetime(2030, 3, 20, 12, tzinfo=MSK).timestamp())
+    starts = datetime.fromtimestamp(now + 86400, timezone.utc).isoformat()
+    reached, release = asyncio.Event(), asyncio.Event()
+    calls = {"schedule": 0, "posts": 0}
+    async def handler(request):
+        if request.method == "POST":
+            calls["posts"] += 1
+            return httpx.Response(200, json={"error_code": 0, "result": [1]})
+        if request.url.path.endswith("/sign/schedule"):
+            calls["schedule"] += 1
+            if calls["schedule"] == 2:
+                reached.set()
+                await release.wait()
+            lesson = {"id": 1, "date": starts, "section_name": "Бег", "room_name": "Зал",
+                      "section_level": 1, "type_id": 2, "available": 1, "signed": False,
+                      "can_sign_in": {"can_sign_in": True}}
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [lesson]}]})
+        if request.url.path.endswith("/personal/calendar"):
+            return httpx.Response(200, json={"error_code": 0, "result": []})
+        return httpx.Response(200, json={"error_code": 0, "result": {"free_attempts": 1, "can_sign_in": True}})
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Бег", "starts_at": starts, "status": "waiting", "refusal_code": None}]
+        client = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        app = KronbotApp(store, sport=client, now=lambda: now, service_active=True)
+        app.sport.sport_types = AsyncMock(return_value=[])
+        app.sport.account_isu = AsyncMock(return_value=None)
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await asyncio.wait_for(reached.wait(), timeout=3)
+            app.action_pause()
+            assert store.data["background_paused"]
+            release.set()
+            await app.busy
+            assert calls["posts"] == 0
+            assert app.agent.queue()[0]["status"] == "waiting"
+        await client.close()
+
+
+async def test_running_service_respects_persisted_pause_on_open(tmp_path):
+    from unittest.mock import AsyncMock
+    from textual.widgets import Static
+
+    now = 1900000000
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        store.data["background_paused"] = True
+        app = KronbotApp(store, now=lambda: now, service_active=True)
+        app.sport.sport_types = AsyncMock(return_value=[])
+        app.sport.account_isu = AsyncMock(return_value=None)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            assert not app.auto and not app.agent.booking_enabled
+            assert "на паузе" in str(app.query_one("#error", Static).render())
+            assert all(not call.kwargs["allow_booking"] for call in app.agent.check.await_args_list)
+        await app.sport.close()
+
+
+async def test_schedule_scroll_survives_service_probe_and_refresh(tmp_path):
+    from unittest.mock import AsyncMock
+    from kronbot.sport import Lesson
+
+    now = 1900000000
+    starts = datetime.fromtimestamp(now + 86400, timezone.utc)
+    lessons = [
+        Lesson(i, f"Секция {i}", "Зал", starts, 1, 2, 1, False, False, True)
+        for i in range(1, 41)
+    ]
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now, service_active=True, service_probe=lambda: True)
+
+        async def refresh(*, allow_booking):
+            app.agent.snapshot = lessons
+
+        app.agent.check = AsyncMock(side_effect=refresh)
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#schedule", DataTable)
+            table.focus()
+            await pilot.press(*(["down"] * 25))
+            await pilot.pause()
+            selected = app._selected(table)
+            assert selected == "26"
+            table.scroll_to(y=12, animate=False, immediate=True)
+            await pilot.pause()
+            position = table.scroll_y
+            assert position > 0
+            await app._probe_service()
+            await pilot.pause()
+            assert table.scroll_y == position
+            assert app._selected(table) == selected
+            app._render()
+            await pilot.pause()
+            assert table.scroll_y == position
+            assert app._selected(table) == selected
         await app.sport.close()

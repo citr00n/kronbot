@@ -22,7 +22,7 @@ from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_te
 from .state import StateError, StateLocked, StateStore, state_directory
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
-SERVICE_PAUSED_NOTICE = "Фоновая автозапись приостановлена. После окончания блокировки выполните kronbot service start."
+SERVICE_PAUSED_NOTICE = "Фоновая автозапись на паузе. После окончания ограничений возобновите её клавишей p в TUI или командой kronbot service start."
 
 
 def positive_id(value):
@@ -60,10 +60,17 @@ def parser():
     queue = sub.add_parser("queue", help="Управлять локальной очередью")
     actions = queue.add_subparsers(dest="queue_command", required=True)
     actions.add_parser("list", help="Показать очередь")
-    for action in ("add", "remove", "retry"):
-        command = actions.add_parser(action)
+    for action in ("add", "forecast", "remove", "retry"):
+        command = actions.add_parser(
+            action, help="Добавить прогноз на 14 суток вперёд" if action == "forecast" else None
+        )
         command.add_argument("id", type=positive_id, metavar="ID")
         if action in ("remove", "retry"):
+            kind = command.add_mutually_exclusive_group()
+            kind.add_argument("--forecast", dest="forecast", action="store_const", const=True,
+                              default=None, help="Выбрать ещё не сопоставленный прогноз")
+            kind.add_argument("--lesson", dest="forecast", action="store_const", const=False,
+                              help="Выбрать занятие или сопоставленный прогноз")
             command.add_argument("--verified-not-booked", action="store_true", help="Подтверждаю самостоятельную проверку в My ITMO")
     book = sub.add_parser("book", help="Попробовать записаться один раз")
     book.add_argument("id", type=positive_id, metavar="ID")
@@ -133,9 +140,17 @@ def _live_session(store, now):
     return session
 
 
+def _unbound_forecast(item):
+    forecast = item.get("forecast")
+    return forecast is not None and not forecast["bound"]
+
+
 def _item_line(item):
     starts = datetime.fromisoformat(item["starts_at"]).astimezone(MSK).strftime("%d.%m.%Y %H:%M")
     status = STATUSES[item["status"]]
+    if item.get("forecast") is not None:
+        status += " — прогноз"
+    status += " [--forecast]" if _unbound_forecast(item) else " [--lesson]"
     if item["refusal_code"] is not None:
         status += f" ({item['refusal_code']})"
     return f"{item['lesson_id']}  {starts}  {clean_text(item['section_name'])}  {status}"
@@ -243,13 +258,15 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
             print(_item_line(item))
         return 0
     if command == "queue" and args.queue_command in ("remove", "retry"):
+        if args.forecast is None and sum(item["lesson_id"] == args.id for item in agent.queue()) > 1:
+            raise QueueError("Укажите --forecast для прогноза или --lesson для занятия.")
         if args.queue_command == "remove":
-            agent.remove(args.id, verified=args.verified_not_booked)
+            agent.remove(args.id, verified=args.verified_not_booked, forecast=args.forecast)
         else:
-            agent.retry(args.id, verified=args.verified_not_booked)
+            agent.retry(args.id, verified=args.verified_not_booked, forecast=args.forecast)
         print("Локальная очередь обновлена.")
         return 0
-    if command == "schedule" or command == "queue" and args.queue_command == "add":
+    if command == "schedule" or command == "queue" and args.queue_command in ("add", "forecast"):
         await agent.check(allow_booking=False)
         if command == "schedule":
             if not agent.snapshot:
@@ -263,8 +280,12 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
             lesson = next((x for x in agent.snapshot if x.id == args.id), None)
             if lesson is None:
                 raise QueueError("Занятие не найдено в расписании.")
-            agent.add(lesson)
-            print("Добавлено в очередь.")
+            if args.queue_command == "forecast":
+                agent.add_forecast(lesson)
+                print("Прогноз занятия добавлен в очередь.")
+            else:
+                agent.add(lesson)
+                print("Добавлено в очередь.")
         return 0
     if command == "book":
         previous = next((x["status"] for x in agent.queue() if x["lesson_id"] == args.id), None)
@@ -273,12 +294,12 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
         except LocalLimit:
             raise
         except SportError:
-            item = next((x for x in agent.queue() if x["lesson_id"] == args.id), None)
+            item = next((x for x in agent.queue() if x["lesson_id"] == args.id and not _unbound_forecast(x)), None)
             if item is None or item["status"] != "uncertain":
                 raise
             print(_item_line(item))
             return 4
-        item = next((x for x in agent.queue() if x["lesson_id"] == args.id), None)
+        item = next((x for x in agent.queue() if x["lesson_id"] == args.id and not _unbound_forecast(x)), None)
         fresh_signed = any(x.id == args.id and x.signed for x in agent.snapshot)
         if args.id in agent.confirmed_ids or fresh_signed:
             print("Уже записан" if fresh_signed else "Записан")
@@ -288,7 +309,7 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
         return 4
     if command == "watch":
         print("Автозапись запущена. Остановка: Ctrl+C.")
-        previous = {x["lesson_id"]: x["status"] for x in agent.queue()}
+        previous = {(x["lesson_id"], _unbound_forecast(x)): x["status"] for x in agent.queue()}
         if any(status in ("waiting", "uncertain") for status in previous.values()):
             wait_until_open = opening_wait(now())
             if wait_until_open:
@@ -316,11 +337,12 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
                 print(str(exc), file=sys.stderr)
             for ident in sorted(agent.confirmed_ids):
                 print(f"{ident}  Записан")
-                previous.pop(ident, None)
+                previous.pop((ident, False), None)
             for item in queue:
-                if previous.get(item["lesson_id"]) != item["status"]:
+                key = (item["lesson_id"], _unbound_forecast(item))
+                if previous.get(key) != item["status"]:
                     print(_item_line(item))
-                previous[item["lesson_id"]] = item["status"]
+                previous[key] = item["status"]
             if cancel.is_set():
                 return 0
             if not any(x["status"] == "waiting" for x in queue):
@@ -412,6 +434,18 @@ def _service_notice(directory: Path, *, install: bool = False) -> str:
         return "Не удалось проверить или установить фоновую службу. Проверьте kronbot service status."
 
 
+def _service_running(directory: Path) -> bool:
+    """Проверить запущенную службу этого каталога без изменения системы."""
+    try:
+        manager = _service_manager()
+        if manager.status() != "running":
+            return False
+        target = manager.configured_state_dir()
+        return target is not None and _same_directory(target, directory)
+    except (RuntimeError, OSError, ValueError):
+        return False
+
+
 def _service_command(args) -> int:
     action = args.service_command
     if action == "run":
@@ -435,7 +469,9 @@ def _service_command(args) -> int:
             try:
                 with StateStore(directory) as store:
                     if store.data["background_paused"]:
-                        print("Автозапись приостановлена из-за ограничения доступа; после окончания блокировки выполните kronbot service start.")
+                        print(
+                            SERVICE_PAUSED_NOTICE
+                        )
                     elif store.data["session"] is None:
                         print("Для автозаписи нужен вход.")
             except StateLocked:

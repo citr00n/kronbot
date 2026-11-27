@@ -13,7 +13,6 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Select, Static, TabbedContent, TabPane
 
-from .agent import Agent, MSK, QueueError
 from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
@@ -77,6 +76,11 @@ class LoginScreen(ModalScreen):
         with Vertical(classes="dialog login-dialog"):
             yield Label("Вход в ИТМО")
             notice = getattr(self.app, "service_notice", "")
+            store = getattr(self.app, "store", None)
+            if store is not None and store.data["background_paused"]:
+                notice = "\n".join(filter(None, (
+                    notice, "Фоновая автозапись на паузе; возобновите её клавишей p после окончания блокировки."
+                )))
             if notice:
                 yield Static(notice, id="service-notice", markup=False)
             yield Select([("Веб-вход", "browser"), ("Логин и пароль", "password"), ("Refresh-токен My ITMO", "refresh"), ("Access-токен My ITMO", "access")], value="browser", allow_blank=False, id="method")
@@ -137,6 +141,8 @@ class LoginScreen(ModalScreen):
                 raise
             self.dismiss(True)
         except (AuthError, BrowserError, SportError, StateError) as exc:
+            if isinstance(exc, (Restricted, NetworkBlocked)):
+                app._stop_for_error(exc)
             self.query_one("#login-error", Static).update(str(exc))
         finally:
             username = secret = ""
@@ -180,6 +186,7 @@ class KronbotApp(App):
     """
     BINDINGS = [
         ("p", "pause", "Авто"),
+        ("f", "forecast", "Прогноз +14д"),
         ("/", "search", "Поиск"),
         ("r", "refresh", "Обновить"),
         ("x", "remove", "Удалить"),
@@ -197,13 +204,23 @@ class KronbotApp(App):
         now=time.time,
         monotonic=time.monotonic,
         service_notice="",
+        service_active=False,
+        service_probe=None,
     ):
         super().__init__()
         self.store = store
         self.sport = sport or SportClient(store, now=now)
         self.agent = Agent(store, self.sport, now=now, monotonic=monotonic)
         self.now, self.monotonic = now, monotonic
-        self.auto = False
+        self.service_active = service_active
+        self.service_probe = service_probe
+        self.service_probe_task = None
+        self.next_service_probe = 0.0
+        self.suspended = False
+        self.resume_after_dialog = False
+        self.seen_uncertain = set()
+        self.auto = bool(service_active and not store.data["background_paused"] and store.data["session"])
+        self.agent.booking_enabled = self.auto
         self.busy = None
         self.last_auto = None
         self.auto_interval = 120.0
@@ -281,7 +298,7 @@ class KronbotApp(App):
             else "—"
         )
         self.query_one("#status", Static).update(
-            f"ИТМО: {'вход выполнен' if session else 'нужен вход'}{expiry}\nАвтозапись: {'включена' if self.auto else 'на паузе'} | Последняя проверка: {checked}"
+            f"ИТМО: {'вход выполнен' if session else 'нужен вход'}{expiry}\nАвтозапись: {'включена' if self.auto else 'на паузе'}{' (служба)' if self.service_active else ' (только TUI)'} | Последняя проверка: {checked}"
         )
         isu = clean_text(str(session.get("isu") or "")) if session else ""
         self.query_one("#account", Static).update(
@@ -298,19 +315,21 @@ class KronbotApp(App):
         messages = [
             ("Данные устарели. " if stale else "") + self.error,
             self.service_notice,
+            "Фоновая автозапись на паузе. p — возобновить после окончания блокировки." if self.store.data["background_paused"] else "",
         ]
         self.query_one("#error", Static).update(
             "\n".join(message for message in messages if message)
         )
         queue = self.agent.queue() if session else []
         table = self.query_one("#schedule", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
         selected = self.hidden_schedule_selection or self._selected(table) or self.schedule_selection
         table.clear()
         visible = [lesson for lesson in self.agent.snapshot if self._matches_filters(lesson)]
         visible_ids = {str(lesson.id) for lesson in visible}
         self.hidden_schedule_selection = selected if selected and selected not in visible_ids else None
         for lesson in visible:
-            queued = next((x for x in queue if x["lesson_id"] == lesson.id), None)
+            queued = [x for x in queue if x["lesson_id"] == lesson.id]
             availability = "Да" if lesson.can_sign_in else "Нет"
             if lesson.intersection:
                 availability += "; Пересечение с расписанием"
@@ -321,7 +340,7 @@ class KronbotApp(App):
                 Text(clean_text(lesson.room_name)),
                 Text(str(lesson.available)),
                 Text(availability),
-                Text(STATUSES[queued["status"]] if queued else ""),
+                Text("; ".join(STATUSES[x["status"]] + (" (прогноз)" if x.get("forecast") is not None else "") for x in queued)),
                 key=str(lesson.id),
             )
         if not visible:
@@ -335,19 +354,35 @@ class KronbotApp(App):
                 Text(""),
             )
         self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
         self.schedule_selection = selected
         table = self.query_one("#queue", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
         selected = self._selected(table)
         table.clear()
         for item in queue:
             status = STATUSES[item["status"]]
+            if item.get("forecast") is not None:
+                status += " — прогноз"
             if item["refusal_code"] is not None:
                 status += f" ({item['refusal_code']})"
-            table.add_row(Text(str(item["lesson_id"])), Text(datetime.fromisoformat(item["starts_at"]).astimezone(MSK).strftime("%d.%m %H:%M")), Text(item["section_name"]), Text(status), key=str(item["lesson_id"]))
+            table.add_row(
+                Text(str(item["lesson_id"])),
+                Text(
+                    datetime.fromisoformat(item["starts_at"])
+                    .astimezone(MSK)
+                    .strftime("%d.%m %H:%M")
+                ),
+                Text(item["section_name"]),
+                Text(status),
+                key=self._queue_key(item),
+            )
         if not queue:
             table.add_row(Text(""), Text("Очередь пуста"), Text(""), Text(""))
         self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
         table = self.query_one("#bookings", DataTable)
+        scroll = (table.scroll_x, table.scroll_y)
         selected = self._selected(table)
         table.clear()
         for booking in self.bookings_snapshot:
@@ -361,6 +396,7 @@ class KronbotApp(App):
         if not self.bookings_snapshot:
             table.add_row(Text(""), Text("Нет активных записей"), Text(""), Text(""))
         self._restore(table, selected)
+        table.call_after_refresh(table.scroll_to, *scroll, animate=False)
 
     def _matches_filters(self, lesson):
         search = self.query_one("#filter-search", Input).value.strip().casefold()
@@ -438,8 +474,7 @@ class KronbotApp(App):
                 if isinstance(exc, LocalLimit):
                     self.limit_until = exc.until
                 if isinstance(exc, (Restricted, LoginRequired, NetworkBlocked)):
-                    self.auto = False
-                    self.agent.booking_enabled = False
+                    self._stop_for_error(exc)
                 if generation == self.filter_generation or isinstance(exc, (LocalLimit, Restricted, LoginRequired, NetworkBlocked)):
                     self.filter_stale = self.filter_type != "all"
                     self.error = str(exc)
@@ -474,6 +509,12 @@ class KronbotApp(App):
         self._render()
 
     @staticmethod
+    def _queue_key(item):
+        forecast = item.get("forecast")
+        kind = "forecast" if forecast is not None and not forecast["bound"] else "lesson"
+        return f"{item['lesson_id']}:{kind}"
+
+    @staticmethod
     def _selected(table):
         try:
             return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
@@ -483,9 +524,53 @@ class KronbotApp(App):
     def _restore(table, key):
         if key:
             try:
-                table.move_cursor(row=table.get_row_index(key))
+                table.move_cursor(row=table.get_row_index(key), scroll=False)
             except Exception:
                 pass
+
+    def _stop_for_error(self, exc):
+        self.auto = False
+        self.agent.booking_enabled = False
+        self.resume_after_dialog = False
+        if isinstance(exc, (Restricted, NetworkBlocked)):
+            self.store.data["background_paused"] = True
+            try:
+                self.store.save()
+            except StateError as save_error:
+                self.service_notice = (
+                    f"Не удалось сохранить паузу: {save_error} "
+                    "После выхода служба может продолжить работу; остановите её отдельно."
+                )
+
+    async def _probe_service(self):
+        try:
+            active = await asyncio.to_thread(self.service_probe)
+        except Exception:
+            active = False
+        if self.stopping:
+            return
+        previous = self.service_active
+        self.service_active = active
+        if previous and not active:
+            self.auto = False
+            self.agent.booking_enabled = False
+            self.service_notice = "Фоновая служба остановлена или недоступна. p включает автозапись только в TUI."
+        elif active and not previous:
+            self.service_notice = ""
+            self.auto = bool(
+                not self.suspended and self.store.data["session"]
+                and not self.store.data["background_paused"]
+            )
+            self.agent.booking_enabled = self.auto
+        if self.is_mounted and previous != active:
+            self._render()
+
+    def _start_service_probe(self):
+        if self.service_probe is None:
+            return None
+        if self.service_probe_task is None or self.service_probe_task.done():
+            self.service_probe_task = asyncio.create_task(self._probe_service())
+        return self.service_probe_task
 
     def _start(self, auto=False, bookings_only=False):
         if self.busy and not self.busy.done() or self.stopping:
@@ -496,6 +581,12 @@ class KronbotApp(App):
         if not auto:
             self.bookings_stale = True
         try:
+            if auto and (not self.auto or self.stopping):
+                return
+            if auto and self.service_active and self.service_probe is not None:
+                await self._start_service_probe()
+                if not self.auto or self.stopping:
+                    return
             if not bookings_only:
                 await self.agent.check(allow_booking=auto)
                 self.stale = False
@@ -513,8 +604,7 @@ class KronbotApp(App):
             if isinstance(exc, LocalLimit):
                 self.limit_until = exc.until
             if isinstance(exc, (Restricted, LoginRequired, NetworkBlocked)):
-                self.auto = False
-                self.agent.booking_enabled = False
+                self._stop_for_error(exc)
         finally:
             if not auto and not self.stopping and self.store.data["session"]:
                 try:
@@ -524,8 +614,7 @@ class KronbotApp(App):
                     if isinstance(exc, LocalLimit):
                         self.limit_until = exc.until
                     if isinstance(exc, (Restricted, LoginRequired, NetworkBlocked)):
-                        self.auto = False
-                        self.agent.booking_enabled = False
+                        self._stop_for_error(exc)
             session = self.store.data["session"]
             if not auto and not self.stopping and session and not session.get("isu") and not self.isu_checked:
                 self.isu_checked = True
@@ -535,15 +624,24 @@ class KronbotApp(App):
                     if isinstance(exc, LocalLimit):
                         self.limit_until = exc.until
                     if isinstance(exc, (Restricted, LoginRequired, NetworkBlocked)):
-                        self.auto = False
-                        self.agent.booking_enabled = False
+                        self._stop_for_error(exc)
                         self.error = str(exc)
             if auto:
                 self.auto_interval = auto_delay(self.now())
                 self.last_auto = self.monotonic()
-                if self.store.data["session"] and not any(x["status"] == "waiting" for x in self.agent.queue()):
-                    self.auto = False
-                    self.agent.booking_enabled = False
+                if self.store.data["session"]:
+                    owner = self.store.data["session"]["sub"]
+                    for item in self.agent.queue():
+                        key = (owner, self._queue_key(item))
+                        if item["status"] == "uncertain":
+                            self.seen_uncertain.add(key)
+                        elif item["status"] == "waiting":
+                            self.seen_uncertain.discard(key)
+                    if not self.service_active and not any(
+                        x["status"] == "waiting" for x in self.agent.queue()
+                    ):
+                        self.auto = False
+                        self.agent.booking_enabled = False
             if schedule_updated and self.filter_type != "all" and not self.stopping:
                 self.filter_generation += 1
                 self.filter_stale = True
@@ -551,12 +649,27 @@ class KronbotApp(App):
             self._render()
 
     def _tick(self):
-        if not self.auto or self.busy and not self.busy.done() or not self.store.data["session"]:
+        if self.stopping:
+            return
+        if self.service_probe is not None and self.monotonic() >= self.next_service_probe:
+            self.next_service_probe = self.monotonic() + 1.0
+            self._start_service_probe()
+        if (
+            not self.auto
+            or self.busy
+            and not self.busy.done()
+            or not self.store.data["session"]
+        ):
             return
         if self.now() < self.limit_until:
             return
         queue = self.agent.queue()
-        if not any(x["status"] in ("waiting", "uncertain") for x in queue):
+        owner = self.store.data["session"]["sub"]
+        if not any(
+            x["status"] == "waiting"
+            or x["status"] == "uncertain" and (owner, self._queue_key(x)) not in self.seen_uncertain
+            for x in queue
+        ):
             return
         if self.last_auto is None and any(x["status"] == "waiting" for x in queue) and opening_wait(self.now()):
             return
@@ -569,11 +682,36 @@ class KronbotApp(App):
         )
 
     def action_pause(self):
-        self.auto = not self.auto
-        self.agent.booking_enabled = self.auto
+        enable = not self.auto
+        if enable:
+            until = max(self.store.data["blocked_until"].values(), default=0)
+            if until > self.now():
+                self.error = str(NetworkBlocked(until))
+                self._render()
+                return
+        self.auto = False
+        self.agent.booking_enabled = False
+        if self.service_active:
+            old = self.store.data["background_paused"]
+            self.store.data["background_paused"] = not enable
+            try:
+                self.store.save()
+            except StateError as exc:
+                self.store.data["background_paused"] = old
+                self.error = (
+                    f"Не удалось сохранить паузу: {exc} "
+                    "После выхода служба может продолжить работу; остановите её отдельно."
+                )
+                self._render()
+                return
+        self.auto = enable
+        self.agent.booking_enabled = enable
+        self.error = ""
         self._render()
         self._tick()
     def action_login(self):
+        self.suspended = True
+        self.resume_after_dialog = self.auto and not self.service_active
         self.auto = False
         self.agent.booking_enabled = False
         self.agent.cancel_enabled = False
@@ -583,6 +721,12 @@ class KronbotApp(App):
             self.push_screen(LoginScreen(), self._login_result)
         asyncio.create_task(open_login())
     def _login_result(self, logged_in):
+        self.suspended = False
+        self.auto = bool(self.store.data["session"] and (
+            (self.resume_after_dialog and not self.service_active)
+            or (self.service_active and not self.store.data["background_paused"])
+        ))
+        self.agent.booking_enabled = self.auto
         self.agent.cancel_enabled = True
         if logged_in:
             self._reset_sport_filter()
@@ -597,6 +741,8 @@ class KronbotApp(App):
         elif self.store.data["session"] is None:
             asyncio.create_task(self.action_quit_safe())
     def action_logout(self):
+        self.suspended = True
+        self.resume_after_dialog = self.auto and not self.service_active
         self.auto = False
         self.agent.booking_enabled = False
         self.agent.cancel_enabled = False
@@ -605,6 +751,13 @@ class KronbotApp(App):
         if confirmed:
             asyncio.create_task(self._logout_after_work())
         else:
+            self.suspended = False
+            self.auto = bool(self.store.data["session"] and (
+                (self.resume_after_dialog and not self.service_active)
+                or (self.service_active and not self.store.data["background_paused"])
+            ))
+            self.agent.booking_enabled = self.auto
+            self._render()
             self.agent.cancel_enabled = True
 
     async def _logout_after_work(self):
@@ -620,8 +773,29 @@ class KronbotApp(App):
         self.bookings_owner = None
         self._reset_sport_filter()
         self.agent.snapshot = []
+        self.suspended = False
         self.agent.cancel_enabled = True
         self._render()
+
+    def action_forecast(self):
+        if self.query_one(TabbedContent).active != "schedule-tab" or not self.store.data["session"]:
+            return
+        key = self._selected(self.query_one("#schedule", DataTable))
+        if not key:
+            return
+        try:
+            if self.stale or self.filter_stale:
+                raise QueueError("Расписание устарело. Обновите его.")
+            lesson = next((x for x in self.agent.snapshot if str(x.id) == key and self._matches_filters(x)), None)
+            if lesson is None:
+                raise QueueError("Занятие не найдено в актуальном расписании.")
+            self.agent.add_forecast(lesson)
+            self.error = "Прогноз занятия добавлен в очередь."
+        except (QueueError, LoginRequired, StateError) as exc:
+            self.error = str(exc)
+        self._render()
+        self._tick()
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         if event.data_table.id == "schedule" and event.row_key.value:
             self.schedule_selection = event.row_key.value
@@ -645,13 +819,22 @@ class KronbotApp(App):
         elif event.data_table.id == "bookings":
             self._confirm_cancel(key)
         elif event.data_table.id == "queue":
-            item = next((x for x in self.agent.queue() if x["lesson_id"] == int(key)), None)
+            item = next(
+                (x for x in self.agent.queue() if self._queue_key(x) == key), None
+            )
             if item and item["status"] == "uncertain":
-                self.push_screen(ConfirmScreen("Проверьте запись в My ITMO. Если записи нет, разрешить новую попытку?"), lambda yes: self._retry(int(key), yes))
+                self.push_screen(
+                    ConfirmScreen(
+                        "Проверьте запись в My ITMO. Если записи нет, разрешить новую попытку?"
+                    ),
+                    lambda yes: self._retry(key, yes),
+                )
+
     def _retry(self, key, yes):
         if yes:
             try:
-                self.agent.retry(key, verified=True)
+                ident, kind = key.split(":")
+                self.agent.retry(int(ident), verified=True, forecast=kind == "forecast")
             except (QueueError, StateError) as exc:
                 self.error = str(exc)
             self._render()
@@ -664,15 +847,22 @@ class KronbotApp(App):
         key = self._selected(self.query_one("#queue", DataTable))
         if not key:
             return
-        item = next((x for x in self.agent.queue() if x["lesson_id"] == int(key)), None)
+        item = next((x for x in self.agent.queue() if self._queue_key(x) == key), None)
         if item and item["status"] == "uncertain":
-            self.push_screen(ConfirmScreen("Проверьте запись в My ITMO. Удалить локальную запись с неизвестным исходом?"), lambda yes: self._remove(int(key), yes))
+            self.push_screen(
+                ConfirmScreen(
+                    "Проверьте запись в My ITMO. Удалить локальную запись с неизвестным исходом?"
+                ),
+                lambda yes: self._remove(key, yes),
+            )
         else:
-            self._remove(int(key), True)
+            self._remove(key, True)
+
     def _remove(self, key, yes):
         if yes:
             try:
-                self.agent.remove(key, verified=True)
+                ident, kind = key.split(":")
+                self.agent.remove(int(ident), verified=True, forecast=kind == "forecast")
             except (QueueError, StateError) as exc:
                 self.error = str(exc)
             self._render()
@@ -740,8 +930,7 @@ class KronbotApp(App):
             if isinstance(exc, LocalLimit):
                 self.limit_until = exc.until
             if isinstance(exc, (Restricted, LoginRequired, NetworkBlocked)):
-                self.auto = False
-                self.agent.booking_enabled = False
+                self._stop_for_error(exc)
         finally:
             self._render()
 
@@ -765,14 +954,19 @@ class KronbotApp(App):
 def run():
     try:
         with StateStore() as store:
-            from .cli import SERVICE_PAUSED_NOTICE, _service_notice
+            from .cli import _service_notice, _service_running
 
             notice = _service_notice(
                 store.directory.expanduser().absolute(), install=True
             )
-            if store.data["background_paused"]:
-                notice = "\n".join(filter(None, (notice, SERVICE_PAUSED_NOTICE)))
-            KronbotApp(store, service_notice=notice).run()
+            directory = store.directory.expanduser().absolute()
+            active = _service_running(directory)
+            if not active and not notice:
+                notice = "Фоновая служба остановлена или недоступна. p включает автозапись только в TUI."
+            KronbotApp(
+                store, service_notice=notice, service_active=active,
+                service_probe=lambda: _service_running(directory),
+            ).run()
         return 0
     except StateLocked as exc:
         print(str(exc), file=sys.stderr)

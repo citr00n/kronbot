@@ -50,6 +50,44 @@ class Lesson:
     signed: bool
     intersection: bool
     can_sign_in: bool
+    section_id: int | None = None
+    lesson_level: int | None = None
+    building_id: int | None = None
+    room_id: int | None = None
+    time_slot_id: int | None = None
+    teacher_isu: int | None = None
+    teacher_name: str = ""
+    ends_at: datetime | None = None
+
+
+def forecast_identity(lesson):
+    """Строгая идентичность повторяющегося занятия либо None."""
+    if (
+        lesson.type_id != 2
+        or not all(_positive_id(value) for value in (
+            lesson.section_id, lesson.teacher_isu, lesson.time_slot_id
+        ))
+        or type(lesson.section_level) is not int
+        or type(lesson.lesson_level) is not int
+        or not (
+            (_positive_id(lesson.building_id) and _positive_id(lesson.room_id))
+            or (lesson.room_id == -1 and lesson.building_id in (None, -1)
+                and type(lesson.room_id) is int
+                and (lesson.building_id is None or type(lesson.building_id) is int))
+        )
+        or not isinstance(lesson.starts_at, datetime)
+        or lesson.starts_at.utcoffset() is None
+        or not isinstance(lesson.ends_at, datetime)
+        or lesson.ends_at.utcoffset() is None
+        or lesson.ends_at <= lesson.starts_at
+    ):
+        return None
+    return (
+        lesson.section_id, lesson.teacher_isu,
+        None if lesson.room_id == -1 else lesson.building_id,
+        lesson.room_id, lesson.section_level, lesson.lesson_level,
+        lesson.type_id, lesson.time_slot_id, lesson.starts_at, lesson.ends_at,
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +145,32 @@ def _lesson(raw):
         intersection = raw.get("intersection", False)
         if not isinstance(section, str) or not isinstance(room, str) or type(intersection) is not bool:
             return None
-        return Lesson(ident, clean_text(section), clean_text(room), starts, level, typ, available, signed, intersection, permitted)
+        try:
+            ends_at = datetime.fromisoformat(raw["date_end"])
+            if ends_at.utcoffset() is None or ends_at <= starts:
+                ends_at = None
+        except (KeyError, TypeError, ValueError):
+            ends_at = None
+        return Lesson(
+            ident,
+            clean_text(section),
+            clean_text(room),
+            starts,
+            level,
+            typ,
+            available,
+            signed,
+            intersection,
+            permitted,
+            section_id=raw.get("section_id"),
+            lesson_level=raw.get("lesson_level"),
+            building_id=raw.get("building_id", 0),
+            room_id=raw.get("room_id"),
+            time_slot_id=raw.get("time_slot_id"),
+            teacher_isu=raw.get("teacher_isu"),
+            teacher_name=clean_text(raw["teacher_fio"]) if isinstance(raw.get("teacher_fio"), str) else "",
+            ends_at=ends_at,
+        )
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
 
@@ -121,6 +184,8 @@ class SportClient:
         self.pending_session = None
         self.stopped = False
         self.in_flight = None
+        self.forecast_ambiguous_times: set[datetime] = set()
+        self.forecast_incomplete = False
 
     async def close(self):
         await self.client.aclose()
@@ -239,9 +304,6 @@ class SportClient:
         times = [t for t in self.store.data["sport_request_times"] if t > now - 3600]
         if len(times) >= 60:
             raise LocalLimit(min(times) + 3600)
-        last = self.store.data["last_enroll_at"]
-        if enrollment is not None and last is not None and last + 120 > now:
-            raise LocalLimit(last + 120)
         times.append(now)
         self.store.data["sport_request_times"] = times
         if enrollment is not None:
@@ -304,11 +366,28 @@ class SportClient:
                 raise SportError("Некорректный вид спорта.")
             params["sport_type_id"] = str(sport_type_id)
         result = await self._request("GET", "sign/schedule", params=params)
-        lessons = [_lesson(raw) for raw in _days(result)]
-        lessons = [lesson for lesson in lessons if lesson is not None]
+        raw_lessons = list(_days(result))
+        lessons = []
+        ambiguous_times = set()
+        incomplete = False
+        for raw in raw_lessons:
+            lesson = _lesson(raw)
+            if lesson is not None:
+                lessons.append(lesson)
+                continue
+            try:
+                starts = datetime.fromisoformat(raw["date"])
+                if starts.utcoffset() is None:
+                    raise ValueError()
+                ambiguous_times.add(starts)
+            except (KeyError, TypeError, ValueError):
+                incomplete = True
         counts = {}
         for lesson in lessons:
             counts[lesson.id] = counts.get(lesson.id, 0) + 1
+        ambiguous_times.update(lesson.starts_at for lesson in lessons if counts[lesson.id] > 1)
+        self.forecast_ambiguous_times = ambiguous_times
+        self.forecast_incomplete = incomplete
         return sorted((lesson for lesson in lessons if counts[lesson.id] == 1), key=lambda x: (x.starts_at, x.id))
 
     async def sport_types(self) -> list[tuple[int, str]]:
@@ -436,8 +515,14 @@ class SportClient:
         if enrollment is None or before_post is None:
             raise SportError("Запись требует подтверждённой очереди.")
         try:
-            result = await self._request("POST", "sign/schedule/lessons", json=[lesson_id], enrollment=enrollment, before_post=before_post)
-            if isinstance(result, list) and all(type(x) is int for x in result) and lesson_id in result:
+            result = await self._request(
+                "POST",
+                "sign/schedule/lessons",
+                json=[lesson_id],
+                enrollment=enrollment,
+                before_post=before_post,
+            )
+            if isinstance(result, list) and len(result) == 1 and type(result[0]) is int and result[0] == lesson_id:
                 return Enrollment("booked")
             return Enrollment("uncertain")
         except ApiRefusal as exc:
