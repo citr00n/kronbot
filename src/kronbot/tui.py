@@ -18,6 +18,7 @@ from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
 from .state import StateError, StateLocked, StateStore
+from .updates import check_update
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
 
@@ -83,6 +84,9 @@ class LoginScreen(ModalScreen):
                 )))
             if notice:
                 yield Static(notice, id="service-notice", markup=False)
+            update_notice = Static(getattr(self.app, "update_notice", ""), id="login-update", markup=False)
+            update_notice.display = bool(getattr(self.app, "update_notice", ""))
+            yield update_notice
             yield Select([("Веб-вход", "browser"), ("Логин и пароль", "password"), ("Refresh-токен My ITMO", "refresh"), ("Access-токен My ITMO", "access")], value="browser", allow_blank=False, id="method")
             yield Static("", id="login-guide", markup=False)
             yield Input(placeholder="Логин", id="username")
@@ -93,6 +97,11 @@ class LoginScreen(ModalScreen):
                 yield Button("Назад", id="back")
     def on_mount(self):
         self._fields()
+        notice = getattr(self.app, "update_notice", "")
+        if notice:
+            widget = self.query_one("#login-update", Static)
+            widget.update(notice)
+            widget.display = True
     def on_select_changed(self, event):
         self._fields()
     def _fields(self):
@@ -173,6 +182,7 @@ class KronbotApp(App):
     .dialog Horizontal { height: auto; align: center middle; }
     .dialog Button { margin: 0 1; }
     #status { height: 3; }
+    #update-notice, #login-update { height: auto; }
     #error { height: 2; }
     TabbedContent { height: 1fr; }
     DataTable { height: 1fr; }
@@ -227,6 +237,7 @@ class KronbotApp(App):
         self.limit_until = 0
         self.error = ""
         self.service_notice = service_notice
+        self.update_notice = ""
         self.stale = False
         self.bookings_snapshot = []
         self.bookings_stale = True
@@ -245,6 +256,9 @@ class KronbotApp(App):
         yield Header()
         yield Static("", id="status", markup=False)
         yield Static("", id="error", markup=False)
+        update_notice = Static("", id="update-notice", markup=False)
+        update_notice.display = False
+        yield update_notice
         with TabbedContent():
             with TabPane("Расписание", id="schedule-tab"):
                 with Horizontal(id="filter-search-row"):
@@ -272,11 +286,31 @@ class KronbotApp(App):
         self.query_one("#queue", DataTable).add_columns("ID", "МСК", "Секция", "Статус")
         self.query_one("#bookings", DataTable).add_columns("ID", "МСК", "Секция", "Зал")
         self._render()
+        self.update_task = asyncio.create_task(self._check_update())
         self.set_interval(0.5, self._tick)
         if self.store.data["session"] is None:
             self.action_login()
         else:
             self.action_refresh()
+
+    def on_unmount(self):
+        self.update_task.cancel()
+
+    async def _check_update(self):
+        try:
+            notice = await asyncio.to_thread(check_update)
+        except Exception:
+            return
+        if not notice or self.stopping:
+            return
+        self.update_notice = notice
+        widget = self.query_one("#update-notice", Static)
+        widget.update(notice)
+        widget.display = True
+        if isinstance(self.screen, LoginScreen):
+            for widget in self.screen.query("#login-update"):
+                widget.update(notice)
+                widget.display = True
 
     def _render(self):
         session = self.store.data["session"]

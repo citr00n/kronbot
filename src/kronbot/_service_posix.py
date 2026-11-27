@@ -269,8 +269,10 @@ def start() -> None:
     path = _path(kind)
     _require_owned(kind, path)
     if kind == "launchd":
-        # A stopped LaunchAgent is unloaded; bootstrap both registers and starts it.
-        if not _launch_loaded():
+        # A stopped LaunchAgent may still be loaded after its process exits.
+        if _launch_loaded():
+            _command(["launchctl", "kickstart", f"{_domain()}/{_LABEL}"])
+        else:
             _command(["launchctl", "bootstrap", _domain(), str(path)])
     else:
         _command(["systemctl", "--user", "start", _UNIT])

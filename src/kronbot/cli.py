@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import warnings
 from dataclasses import asdict
 from datetime import datetime
@@ -20,6 +21,7 @@ from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
 from .state import StateError, StateLocked, StateStore, state_directory
+from .updates import check_update
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
 SERVICE_PAUSED_NOTICE = "Фоновая автозапись на паузе. После окончания ограничений возобновите её клавишей p в TUI или командой kronbot service start."
@@ -75,6 +77,7 @@ def parser():
     book = sub.add_parser("book", help="Попробовать записаться один раз")
     book.add_argument("id", type=positive_id, metavar="ID")
     sub.add_parser("watch", help="Ожидать места в переднем плане")
+    sub.add_parser("doctor", help="Проверить и восстановить фоновую службу")
     browser = sub.add_parser("browser", help="Установить Chromium для веб-входа")
     browser_commands = browser.add_subparsers(dest="browser_command", required=True)
     install_browser = browser_commands.add_parser("install", help="Установить Chromium")
@@ -504,6 +507,82 @@ def _service_command(args) -> int:
         print("Фоновая служба удалена; очередь и вход сохранены.")
     return 0
 
+def _doctor() -> int:
+    """Проверить службу без изменения её определения и локального состояния."""
+    directory = state_directory().expanduser().absolute()
+    try:
+        manager = _service_manager()
+        status = manager.status()
+        if status == "not installed":
+            print("Фоновая служба не установлена. Установить: kronbot service install.")
+            return 1
+        target = manager.configured_state_dir()
+        if target is None or not _same_directory(target, directory):
+            print("Служба настроена для другого каталога состояния. Проверьте KRONBOT_STATE_DIR.", file=sys.stderr)
+            return 1
+        if status not in ("running", "stopped"):
+            raise RuntimeError("Не удалось определить состояние службы.")
+        with StateStore(directory) as store:
+            try:
+                _live_session(store, time.time())
+            except LoginRequired:
+                print("Для автозаписи нужен вход: kronbot login.")
+            else:
+                print("Вход доступен.")
+            blocked = max(store.data["blocked_until"].values(), default=0) > time.time()
+            paused = store.data["background_paused"]
+            if status == "running":
+                print("Фоновая служба запущена.")
+                if blocked:
+                    print("Действует сетевое ограничение; дождитесь его окончания.")
+                if paused:
+                    print(SERVICE_PAUSED_NOTICE)
+                return 0
+            if blocked:
+                print("Служба остановлена; действует сетевое ограничение. Дождитесь его окончания.", file=sys.stderr)
+                return 3
+            if paused:
+                print(f"Служба остановлена. {SERVICE_PAUSED_NOTICE}", file=sys.stderr)
+                return 3
+            manager.start()
+        # The service needs the state lock to start; never hold it while verifying.
+        deadline = time.monotonic() + 2
+        while True:
+            status = manager.status()
+            if status == "running":
+                print("Фоновая служба запущена.")
+                return 0
+            if status != "stopped" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        print("Служба не запустилась. Проверьте её состояние и путь к kronbot; при необходимости переустановите службу командами kronbot service uninstall и kronbot service install.", file=sys.stderr)
+        return 1
+    except StateLocked:
+        print("Состояние занято; повторите kronbot doctor позже.", file=sys.stderr)
+        return 1
+    except (StateError, RuntimeError, OSError, ValueError):
+        print("Не удалось проверить или запустить службу. Проверьте kronbot service status и путь к установленному kronbot; при необходимости выполните kronbot service uninstall, затем kronbot service install.", file=sys.stderr)
+        return 1
+
+
+def _interactive_update_notice() -> None:
+    result = []
+
+    def check():
+        try:
+            advice = check_update()
+            if advice:
+                result.append(advice)
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=check, daemon=True)
+    worker.start()
+    worker.join(1.5)
+    if result:
+        print(result[0], file=sys.stderr)
+
+
 def main() -> int:
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
@@ -520,6 +599,11 @@ def main() -> int:
             print("Не найден TUI. Переустановите: uv tool install --force . или pipx reinstall kronbot", file=sys.stderr)
             return 2
         return run()
+    if (args.command not in ("browser", "book", "watch", "service")
+            and sys.stdin.isatty() and sys.stderr.isatty()):
+        _interactive_update_notice()
+    if args.command == "doctor":
+        return _doctor()
     if args.command == "browser":
         command = [sys.executable, "-m", "playwright", "install"]
         if args.with_deps:

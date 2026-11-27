@@ -31,8 +31,8 @@ jobs:
           import tomllib
 
           tag = os.environ['GITHUB_REF_NAME']
-          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag, re.ASCII):
-              raise SystemExit('Release tag must be a canonical stable version vX.Y.Z')
+          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:(?:a|\.dev)(?:0|[1-9][0-9]*))?', tag, re.ASCII):
+              raise SystemExit('Release tag must be vX.Y.Z, vX.Y.ZaN or vX.Y.Z.devN')
           with open('pyproject.toml', 'rb') as file:
               project = tomllib.load(file)['project']
           if project['name'] != 'kronbot' or tag != 'v' + project['version']:
@@ -133,5 +133,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" --jq .body > "$RUNNER_TEMP/kronbot-release-notes.md"
+          prerelease=''
+          if [[ "$GITHUB_REF_NAME" =~ (a|\.dev)[0-9]+$ ]]; then
+            prerelease=--prerelease
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/kronbot-release-notes.md" ${prerelease:+"$prerelease"}

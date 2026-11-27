@@ -130,6 +130,21 @@ def test_launchd_stopped_uninstall_and_start(manager, monkeypatch, tmp_path):
     assert not any(args[1] == "bootout" for args in calls)
 
 
+def test_launchd_loaded_but_stopped_is_restarted(manager, monkeypatch, tmp_path):
+    monkeypatch.setattr(service, "_platform", lambda: "launchd")
+    service.install(str(tmp_path / "app"), tmp_path / "state")
+    calls = []
+
+    def loaded_but_stopped(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="state = waiting\n", stderr="")
+
+    monkeypatch.setattr(service.subprocess, "run", loaded_but_stopped)
+    assert service.status() == "stopped"
+    service.start()
+    assert ["launchctl", "kickstart", "gui/1234/ru.kronbot.agent"] in calls
+
+
 def test_safe_manager_failure_and_invalid_paths(manager, monkeypatch, tmp_path):
     monkeypatch.setattr(service, "_platform", lambda: "systemd")
     with pytest.raises(RuntimeError):

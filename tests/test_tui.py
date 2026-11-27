@@ -15,6 +15,7 @@ def no_account_network(monkeypatch):
     from unittest.mock import AsyncMock
     monkeypatch.setattr(SportClient, "account_isu", AsyncMock(return_value=None), raising=False)
     monkeypatch.setattr(SportClient, "sport_types", AsyncMock(return_value=[]), raising=False)
+    monkeypatch.setattr("kronbot.tui.check_update", lambda: None)
 
 
 async def test_startup_read_only_refresh(tmp_path):
@@ -737,4 +738,27 @@ async def test_schedule_scroll_survives_service_probe_and_refresh(tmp_path):
             await pilot.pause()
             assert table.scroll_y == position
             assert app._selected(table) == selected
+        await app.sport.close()
+
+
+@pytest.mark.parametrize("notice", ["Доступна новая версия kronbot 2.0. Обновите: uv tool upgrade kronbot или pipx upgrade kronbot.", None])
+async def test_update_notice_on_login_without_service_interference(tmp_path, monkeypatch, notice):
+    from textual.widgets import Static
+    from kronbot.tui import LoginScreen
+
+    monkeypatch.setattr("kronbot.tui.check_update", lambda: notice)
+    with StateStore(tmp_path / "state") as store:
+        app = KronbotApp(store, service_notice="Служба недоступна")
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await app.update_task
+            await pilot.pause()
+            assert isinstance(app.screen, LoginScreen)
+            update = app.screen.query_one("#login-update", Static)
+            assert update.display is bool(notice)
+            if notice:
+                assert notice in str(update.render())
+            assert "Служба недоступна" in str(app.screen.query_one("#service-notice", Static).render())
+            assert store.data["session"] is None
+            assert not app.auto
         await app.sport.close()
