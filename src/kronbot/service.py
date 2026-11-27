@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from .agent import Agent, MSK
+from .agent import MSK, Agent, auto_delay, opening_wait
 from .auth import AuthError, LoginRequired, Restricted
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError
 from .state import StateError, StateLocked, StateStore
@@ -59,6 +59,10 @@ class BackgroundRunner:
                              and (sub, item["lesson_id"]) not in self.seen_uncertain]
                 if not waiting and not uncertain:
                     return 5.0
+                if waiting and self.next_check == 0:
+                    delay = opening_wait(self.now())
+                    if delay:
+                        return min(5.0, delay)
                 client = self.client_factory(store, now=self.now)
                 agent = Agent(store, client, now=self.now, monotonic=self.monotonic)
                 self.active_client, self.active_agent = client, agent
@@ -99,10 +103,11 @@ class BackgroundRunner:
                         print(str(exc), file=sys.stderr, flush=True)
                 finally:
                     self.seen_uncertain.update((sub, item["lesson_id"]) for item in queue if item["status"] == "uncertain")
+                    await client.close()
+                    delay = auto_delay(self.now(), delay)
                     self.next_check = self.monotonic() + delay
                     self.active_agent = None
                     self.active_client = None
-                    await client.close()
                 return min(5.0, delay)
         except StateLocked:
             return 2.0

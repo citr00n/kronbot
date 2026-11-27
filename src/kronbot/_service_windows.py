@@ -75,6 +75,58 @@ def _require_owned(folder, sid: str):
     return task
 
 
+def _split_arguments(arguments: str) -> list[str]:
+    """Decode Task Scheduler arguments using the Windows command-line rules."""
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    count = ctypes.c_int()
+    # A dummy executable ensures the first real argument is parsed as an argument,
+    # rather than under the special rules for argv[0].
+    argv = shell32.CommandLineToArgvW("kronbot.exe " + arguments, ctypes.byref(count))
+    if not argv:
+        raise OSError("CommandLineToArgvW failed")
+    try:
+        return [argv[index] for index in range(1, count.value)]
+    finally:
+        kernel32.LocalFree(ctypes.cast(argv, wintypes.HLOCAL))
+
+
+def configured_state_dir() -> Path | None:
+    try:
+        with _scheduler() as (_, folder, sid):
+            task = _get_task(folder)
+            if task is None:
+                return None
+            if not _owned(task, sid):
+                raise _ServiceError("Имя службы занято другой задачей.")
+            arguments = task.Definition.Actions.Item(1).Arguments
+            if not isinstance(arguments, str) or "\0" in arguments:
+                raise ValueError
+            parts = _split_arguments(arguments)
+            if len(parts) != 4 or parts[:3] != ["service", "run", "--state-dir"]:
+                raise ValueError
+            state_dir = Path(parts[3])
+            if not state_dir.is_absolute():
+                raise ValueError
+            return state_dir
+    except _ServiceError as error:
+        raise RuntimeError(str(error)) from None
+    except Exception:
+        raise RuntimeError(
+            "Не удалось определить каталог состояния службы kronbot."
+        ) from None
+
+
 def install(executable: str, state_dir: Path) -> None:
     if not isinstance(executable, str) or not os.path.isabs(executable) or not state_dir.is_absolute():
         raise RuntimeError("Для службы нужны абсолютные пути.")

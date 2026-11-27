@@ -97,7 +97,91 @@ def _require_owned(kind: str, path: Path) -> None:
         raise RuntimeError("Не удалось прочитать конфигурацию службы.") from None
 
 
-def _command(args: list[str], *, allowed: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
+def _unquote(token: str) -> str:
+    """Reverse exactly the escaping produced by _quote, in a single pass."""
+    result = []
+    index = 1
+    while index < len(token) - 1:
+        char = token[index]
+        if char == "\\":
+            index += 1
+            char = token[index]
+            if char == "x":
+                char = chr(int(token[index + 1 : index + 3], 16))
+                index += 2
+        elif char in ("%", "$"):
+            if token[index : index + 2] != char * 2:
+                raise ValueError
+            index += 1
+        result.append(char)
+        index += 1
+    value = "".join(result)
+    if _quote(value) != token:
+        raise ValueError
+    return value
+
+
+def configured_state_dir() -> Path | None:
+    """Read the state directory from this application's installed definition."""
+    kind = _platform()
+    path = _path(kind)
+    try:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        if path.is_symlink() or not path.is_file():
+            raise ValueError
+        data = path.read_bytes()
+        if not _owned(kind, data):
+            raise ValueError
+        if kind == "launchd":
+            args = plistlib.loads(data)["ProgramArguments"]
+            executable, directory = args[0], args[4]
+        else:
+            text = data.decode("utf-8")
+            line = next(
+                line for line in text.split("\n") if line.startswith("ExecStart=")
+            )
+            token = r'"(?:[^"\\\n\r]|\\(?:[\\"]|x[0-9a-f]{2}))*"'
+            match = re.fullmatch(
+                r"ExecStart=("
+                + token
+                + r') "service" "run" "--state-dir" ('
+                + token
+                + r")",
+                line,
+            )
+            if match is None:
+                raise ValueError
+            executable, directory = (_unquote(value) for value in match.groups())
+        if (
+            "\x00" in executable
+            or "\x00" in directory
+            or not Path(executable).is_absolute()
+            or not Path(directory).is_absolute()
+        ):
+            raise ValueError
+        return Path(directory)
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        UnicodeError,
+        OverflowError,
+        ExpatError,
+        StopIteration,
+        KeyError,
+        IndexError,
+    ):
+        raise RuntimeError(
+            "Не удалось прочитать принадлежащую kronbot конфигурацию службы."
+        ) from None
+
+
+def _command(
+    args: list[str], *, allowed: tuple[int, ...] = (0,)
+) -> subprocess.CompletedProcess:
     try:
         result = subprocess.run(args, shell=False, capture_output=True, text=True,
                                 timeout=_TIMEOUT, check=False)

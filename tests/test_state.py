@@ -12,7 +12,7 @@ from kronbot.state import StateError, StateStore
 def test_state_roundtrip(tmp_path):
     directory = tmp_path / "кириллица test"
     with StateStore(directory) as store:
-        store.data["session"] = {"sub": "owner", "access_token": "synthetic-access", "access_expires_at": 100, "refresh_token": "synthetic-refresh", "refresh_expires_at": 200}
+        store.data["session"] = {"sub": "owner", "access_token": "synthetic-access", "access_expires_at": 100, "refresh_token": "synthetic-refresh", "refresh_expires_at": 200, "isu": "123456"}
         store.save()
         store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Тест", "starts_at": "2030-01-01T12:00:00+03:00", "status": "waiting", "refusal_code": None}]
         store.save()
@@ -25,6 +25,7 @@ def test_state_roundtrip(tmp_path):
         assert stat.S_IMODE((directory / "kronbot.lock").stat().st_mode) == 0o600
     with StateStore(directory) as store:
         assert store.data["session"]["refresh_token"] == "synthetic-refresh"
+        assert store.data["session"]["isu"] == "123456"
         assert store.data["queues"]["owner"][0]["lesson_id"] == 1
 
 
@@ -55,3 +56,40 @@ def test_lock_excludes_other_process(tmp_path):
         assert process.wait(timeout=10) == 0
     with StateStore(directory) as store:
         assert store.data["queues"] == {}
+
+
+def test_legacy_session_migrates_and_is_persisted(tmp_path):
+    from kronbot.state import empty_state
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.save()
+    legacy = empty_state()
+    legacy["session"] = {
+        "sub": "owner", "access_token": "access", "access_expires_at": 100,
+        "refresh_token": "refresh", "refresh_expires_at": 200,
+    }
+    raw = json.dumps(legacy).encode()
+    if os.name == "nt":
+        import base64
+        import win32crypt
+        blob = win32crypt.CryptProtectData(raw, "kronbot state", None, None, None, 1)
+        raw = json.dumps({"version": 1, "dpapi": base64.b64encode(blob).decode()}).encode()
+    (directory / "state.json").write_bytes(raw)
+    with StateStore(directory) as store:
+        assert store.data["session"]["isu"] is None
+        store.save()
+    with StateStore(directory) as store:
+        assert store.data["session"]["isu"] is None
+        assert store.data["session"]["refresh_token"] == "refresh"
+
+
+@pytest.mark.parametrize("isu", ["", "0", "１２３", "12\n", 123, True, []])
+def test_invalid_stored_isu_is_rejected(tmp_path, isu):
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {
+            "sub": "owner", "access_token": "access", "access_expires_at": 100,
+            "refresh_token": None, "refresh_expires_at": None, "isu": isu,
+        }
+        with pytest.raises(StateError):
+            store.save()

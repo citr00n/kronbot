@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -143,3 +145,77 @@ def test_relative_paths_are_rejected(scheduler, tmp_path):
     with pytest.raises(RuntimeError):
         windows.install("kronbot.exe", tmp_path)
     folder.RegisterTaskDefinition.assert_not_called()
+
+
+def test_configured_state_dir_missing(scheduler):
+    assert windows.configured_state_dir() is None
+
+
+def test_configured_state_dir_owned(scheduler, monkeypatch, tmp_path):
+    _, folder, task = scheduler
+    folder.GetTask.side_effect = None
+    folder.GetTask.return_value = task
+    definition = task.Definition
+    definition.RegistrationInfo.Description = windows._MARKER
+    definition.Principal.UserId = "S-1-5-21-123"
+    definition.Principal.LogonType = 3
+    state_dir = tmp_path / "Данные с пробелом"
+    arguments = subprocess.list2cmdline(["service", "run", "--state-dir", str(state_dir)])
+    definition.Actions.Item.return_value.Arguments = arguments
+    parser = MagicMock(return_value=["service", "run", "--state-dir", str(state_dir)])
+    monkeypatch.setattr(windows, "_split_arguments", parser)
+
+    assert windows.configured_state_dir() == state_dir
+    parser.assert_called_once_with(arguments)
+    task.Run.assert_not_called()
+    task.Stop.assert_not_called()
+    folder.RegisterTaskDefinition.assert_not_called()
+    folder.DeleteTask.assert_not_called()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("Description", "foreign"),
+    ("UserId", "S-1-5-21-other"),
+    ("LogonType", 1),
+])
+def test_configured_state_dir_rejects_foreign_task(scheduler, monkeypatch, field, value):
+    _, folder, task = scheduler
+    folder.GetTask.side_effect = None
+    folder.GetTask.return_value = task
+    definition = task.Definition
+    definition.RegistrationInfo.Description = windows._MARKER
+    definition.Principal.UserId = "S-1-5-21-123"
+    definition.Principal.LogonType = 3
+    setattr(definition.RegistrationInfo if field == "Description" else definition.Principal, field, value)
+    parser = MagicMock()
+    monkeypatch.setattr(windows, "_split_arguments", parser)
+    with pytest.raises(RuntimeError):
+        windows.configured_state_dir()
+    parser.assert_not_called()
+
+
+@pytest.mark.parametrize("parts", [
+    ["service", "run", "--state-dir", "relative"],
+    ["service", "run", "--state-dir"],
+    ["service", "run", "--state-dir", "/absolute", "extra"],
+    ["other", "run", "--state-dir", "/absolute"],
+])
+def test_configured_state_dir_rejects_invalid_arguments(scheduler, monkeypatch, parts):
+    _, folder, task = scheduler
+    folder.GetTask.side_effect = None
+    folder.GetTask.return_value = task
+    task.Definition.RegistrationInfo.Description = windows._MARKER
+    task.Definition.Principal.UserId = "S-1-5-21-123"
+    task.Definition.Principal.LogonType = 3
+    task.Definition.Actions.Item.return_value.Arguments = "secret-token"
+    monkeypatch.setattr(windows, "_split_arguments", lambda _: parts)
+    with pytest.raises(RuntimeError) as error:
+        windows.configured_state_dir()
+    assert "secret-token" not in str(error.value)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows command-line parser")
+def test_split_arguments_windows_unicode_and_quotes():
+    state = Path(r"C:\Данные с пробелом\папка")
+    parts = ["service", "run", "--state-dir", str(state)]
+    assert windows._split_arguments(subprocess.list2cmdline(parts)) == parts
