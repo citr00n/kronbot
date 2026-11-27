@@ -61,6 +61,21 @@ class Session:
     access_expires_at: int
     refresh_token: str | None
     refresh_expires_at: int | None
+    isu: str | None = None
+
+
+def parse_isu(value: object) -> str | None:
+    """Принять только положительный десятичный номер из доверенного ответа."""
+    if type(value) is int and value > 0:
+        return str(value)
+    if (
+        isinstance(value, str)
+        and value.isascii()
+        and value.isdecimal()
+        and any(c != "0" for c in value)
+    ):
+        return value
+    return None
 
 
 class AuthError(Exception):
@@ -158,20 +173,27 @@ class ItmoAuth:
             raise error
         return response
 
-    async def _userinfo(self, client: httpx.AsyncClient, token: str) -> str:
+    async def _userinfo(self, client: httpx.AsyncClient, token: str) -> tuple[str, str | None]:
         response = await self._request(client, "GET", USERINFO_URL, headers={"Authorization": f"Bearer {token}"})
         try:
             if not response.is_success:
                 raise ValueError()
-            sub = response.json()["sub"]
+            body = response.json()
+            sub = body["sub"]
             if not isinstance(sub, str) or not sub.strip():
                 raise ValueError()
-            return sub
+            # Only an explicit claim from authenticated userinfo is usable.
+            return sub, parse_isu(body.get("isu"))
         except (ValueError, KeyError, TypeError):
             raise AuthError("Не удалось подтвердить владельца токена.") from None
 
-    async def _exchange(self, client: httpx.AsyncClient, data: dict[str, str], sub: str | None = None) -> Session:
-        response = await self._request(client, "POST", TOKEN_URL, data={"client_id": CLIENT_ID, **data})
+    async def _exchange(
+        self, client: httpx.AsyncClient, data: dict[str, str], sub: str | None = None,
+        isu: str | None = None,
+    ) -> Session:
+        response = await self._request(
+            client, "POST", TOKEN_URL, data={"client_id": CLIENT_ID, **data}
+        )
         received_at = int(self.now())
         try:
             body = response.json()
@@ -188,8 +210,10 @@ class ItmoAuth:
         except (ValueError, KeyError, TypeError):
             raise AuthError("Не удалось обновить токены ITMO.ID.") from None
         if sub is None:
-            sub = await self._userinfo(client, access)
-        return Session(sub, access, received_at + expires, refresh, received_at + refresh_expires)
+            sub, isu = await self._userinfo(client, access)
+        return Session(
+            sub, access, received_at + expires, refresh, received_at + refresh_expires, isu
+        )
 
     async def _code(self, client: httpx.AsyncClient, callback: str, state: str, verifier: str) -> Session:
         try:
@@ -215,7 +239,8 @@ class ItmoAuth:
     async def import_access(self, token: str) -> Session:
         expiry = _access_exp(token, self.now())
         async with self._client() as client:
-            return Session(await self._userinfo(client, token), token, expiry, None, None)
+            sub, isu = await self._userinfo(client, token)
+            return Session(sub, token, expiry, None, None, isu)
 
     async def import_refresh(self, token: str) -> Session:
         async with self._client() as client:
@@ -225,8 +250,12 @@ class ItmoAuth:
         if not session.refresh_token or not session.refresh_expires_at or session.refresh_expires_at <= self.now():
             raise LoginRequired("Нужен новый вход.")
         async with self._client() as client:
-            return await self._exchange(client, {"grant_type": "refresh_token",
-                                                 "refresh_token": session.refresh_token}, session.sub)
+            return await self._exchange(
+                client,
+                {"grant_type": "refresh_token", "refresh_token": session.refresh_token},
+                session.sub,
+                session.isu,
+            )
 
     async def login_browser(self, cancel: asyncio.Event) -> Session:
         from .browser import BrowserRestricted, browser_login

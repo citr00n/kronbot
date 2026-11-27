@@ -10,7 +10,7 @@ from kronbot.state import StateStore
 
 
 def session(now):
-    return {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000,
+    return {"sub": "owner", "access_token": "access", "access_expires_at": int(now + 10000),
             "refresh_token": None, "refresh_expires_at": None}
 
 
@@ -54,7 +54,7 @@ async def test_service_releases_lock_and_books_new_queue_items(tmp_path):
     await runner.cycle()
     assert posts == [b"[1]"]
     with StateStore(directory) as store:
-        assert store.data["queues"]["owner"][0]["status"] == "booked"
+        assert store.data["queues"]["owner"] == []
     clock["wall"] += 121
     clock["mono"] += 121
     before = len(calls)
@@ -149,3 +149,81 @@ async def test_rotated_tokens_are_kept_until_saved(tmp_path, monkeypatch):
     assert len(refreshes) == 1 and not requests
     with StateStore(directory) as store:
         assert store.data["session"]["refresh_token"] == "new-refresh"
+
+
+@pytest.mark.parametrize("remaining,expected", [(250, 120), (150, 150), (120, 120), (90, 120)])
+async def test_service_reserves_midnight_without_shortening_interval(tmp_path, remaining, expected):
+    from kronbot.agent import MSK
+
+    midnight = datetime(2030, 1, 16, tzinfo=MSK).timestamp()
+    clock = {"wall": midnight - remaining, "mono": 1000.0}
+    start = datetime.fromtimestamp(midnight + 86400, timezone.utc).isoformat()
+    calls = []
+
+    def handler(request):
+        calls.append((clock["wall"], request))
+        return httpx.Response(200, json={"error_code": 0, "result": []})
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = session(clock["wall"])
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Секция",
+                                          "starts_at": start, "status": "waiting",
+                                          "refusal_code": None}]
+        store.save()
+    runner = BackgroundRunner(directory, now=lambda: clock["wall"], monotonic=lambda: clock["mono"],
+                              client_factory=lambda store, now: SportClient(
+                                  store, now=now, transport=httpx.MockTransport(handler)))
+    runner.next_check = 1  # Предыдущий автоцикл уже завершён.
+    await runner.cycle()
+    assert len(calls) == 1
+    assert runner.next_check == 1000 + expected
+    clock["wall"] += expected - 1
+    clock["mono"] += expected - 1
+    await runner.cycle()
+    assert len(calls) == 1
+    clock["wall"] += 1
+    clock["mono"] += 1
+    await runner.cycle()
+    assert len(calls) == 2
+
+
+def test_midnight_reservation_respects_local_limit():
+    from kronbot.agent import MSK, auto_delay
+
+    midnight = datetime(2030, 1, 16, tzinfo=MSK).timestamp()
+    assert auto_delay(midnight - 150, 300) == 300
+    assert auto_delay(midnight - 350, 300) == 350
+
+
+async def test_first_cycle_with_new_queue_waits_for_opening(tmp_path):
+    from kronbot.agent import MSK
+
+    midnight = datetime(2030, 1, 16, tzinfo=MSK).timestamp()
+    clock = {"wall": midnight - 5, "mono": 1000.0}
+    start = datetime.fromtimestamp(midnight + 14 * 86400, timezone.utc).isoformat()
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"error_code": 0, "result": []})
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = session(clock["wall"])
+        store.save()
+    runner = BackgroundRunner(directory, now=lambda: clock["wall"], monotonic=lambda: clock["mono"],
+                              client_factory=lambda store, now: SportClient(
+                                  store, now=now, transport=httpx.MockTransport(handler)))
+    await runner.cycle()
+    with StateStore(directory) as store:
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Секция",
+                                          "starts_at": start, "status": "waiting",
+                                          "refusal_code": None}]
+        store.save()
+    assert await runner.cycle() == 5
+    assert not calls
+    clock["wall"] += 5
+    clock["mono"] += 5
+    await runner.cycle()
+    assert len(calls) == 1

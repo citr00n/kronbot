@@ -8,7 +8,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from .auth import ItmoAuth, LoginRequired, Restricted, Session
+from .auth import ItmoAuth, LoginRequired, Restricted, Session, parse_isu
 
 BASE = "https://my.itmo.ru/api/sport/"
 
@@ -50,6 +50,17 @@ class Lesson:
     signed: bool
     intersection: bool
     can_sign_in: bool
+
+
+@dataclass(frozen=True)
+class Booking:
+    id: int
+    starts_at: datetime
+    section_name: str
+    room_name: str
+    section_level: int
+    lesson_group_id: int | None
+    ends_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +187,52 @@ class SportClient:
             raise LoginRequired("Нужен новый вход.")
         return session
 
+    async def account_isu(self) -> str | None:
+        """Получить ИСУ текущего владельца из подтверждённого self endpoint."""
+        self.check_blocks()
+        session = self._session()
+        # This optional lookup must not rotate a token after a successful login.
+        if session.access_expires_at <= self.now():
+            return None
+        try:
+            async with asyncio.timeout(15):
+                response = await self.client.get(
+                    "https://my.itmo.ru/api/eduPlanNew/programs",
+                    headers={"Authorization": f"Bearer {session.access_token}"},
+                )
+        except (httpx.HTTPError, TimeoutError):
+            raise SportError("Не удалось получить номер ИСУ.") from None
+        if response.status_code in (403, 429):
+            self._block("my.itmo.ru", response.status_code, response.headers.get("Retry-After"))
+        if not response.is_success:
+            raise SportError("Не удалось получить номер ИСУ.")
+        if "text/html" in response.headers.get("content-type", "").lower():
+            self._block("my.itmo.ru", 403)
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict) or "error_code" not in payload:
+                raise ValueError()
+            code = payload["error_code"]
+            result = payload["result"]
+            if ((code is not None and type(code) is not int) or code not in (None, 0)
+                    or not isinstance(result, dict) or not isinstance(result.get("programs"), list)):
+                raise ValueError()
+            isu = parse_isu(result.get("isu"))
+        except (TypeError, ValueError, KeyError):
+            raise SportError("Не удалось получить номер ИСУ.") from None
+        active = self.store.data["session"]
+        if active is None or active["sub"] != session.sub:
+            raise LoginRequired("Аккаунт изменился.")
+        if isu is not None:
+            old = active.get("isu")
+            active["isu"] = isu
+            try:
+                self.store.save()
+            except Exception:
+                active["isu"] = old
+                raise
+        return isu
+
     def reserve(self, *, enrollment=None):
         self.check_blocks()
         now = int(self.now())
@@ -212,7 +269,7 @@ class SportClient:
             if response.status_code in (403, 429):
                 self._block("my.itmo.ru", response.status_code, response.headers.get("Retry-After"))
             if response.status_code == 401:
-                if method == "POST":
+                if method != "GET":
                     raise HttpUnauthorized("Нужен новый вход.")
                 if attempt == 0:
                     await self.refresh()
@@ -240,14 +297,35 @@ class SportClient:
                 raise SportError("Некорректный ответ спортивного API.") from None
         raise SportError("Нужен новый вход.")
 
-    async def schedule(self, start: date, end: date) -> list[Lesson]:
-        result = await self._request("GET", "sign/schedule", params={"date_start": start.isoformat(), "date_end": end.isoformat()})
+    async def schedule(self, start: date, end: date, *, sport_type_id: int | None = None) -> list[Lesson]:
+        params = {"date_start": start.isoformat(), "date_end": end.isoformat()}
+        if sport_type_id is not None:
+            if not _positive_id(sport_type_id):
+                raise SportError("Некорректный вид спорта.")
+            params["sport_type_id"] = str(sport_type_id)
+        result = await self._request("GET", "sign/schedule", params=params)
         lessons = [_lesson(raw) for raw in _days(result)]
         lessons = [lesson for lesson in lessons if lesson is not None]
         counts = {}
         for lesson in lessons:
             counts[lesson.id] = counts.get(lesson.id, 0) + 1
         return sorted((lesson for lesson in lessons if counts[lesson.id] == 1), key=lambda x: (x.starts_at, x.id))
+
+    async def sport_types(self) -> list[tuple[int, str]]:
+        result = await self._request("GET", "sign/schedule/filters")
+        if not isinstance(result, dict) or not isinstance(result.get("sport_type_id"), list):
+            raise SportError("Не удалось получить виды спорта.")
+        types = []
+        seen = set()
+        for item in result["sport_type_id"]:
+            if not isinstance(item, dict) or not _positive_id(item.get("id")) or not isinstance(item.get("value"), str):
+                raise SportError("Не удалось получить виды спорта.")
+            ident, name = item["id"], clean_text(item["value"])
+            if ident in seen or not name:
+                raise SportError("Не удалось получить виды спорта.")
+            seen.add(ident)
+            types.append((ident, name))
+        return types
 
     async def calendar_ids(self, start: date, end: date) -> set[int]:
         result = await self._request("GET", "personal/calendar", params={"date_start": start.isoformat(), "date_end": end.isoformat()})
@@ -257,6 +335,95 @@ class SportClient:
                 raise SportError("Некорректный календарь спортивного API.")
             ids.add(item["id"])
         return ids
+
+    async def bookings(self, start: date, end: date) -> list[Booking]:
+        result = await self._request(
+            "GET",
+            "personal/calendar",
+            params={"date_start": start.isoformat(), "date_end": end.isoformat()},
+        )
+        bookings = []
+        seen = set()
+        for item in _days(result):
+            try:
+                if not isinstance(item, dict):
+                    raise ValueError()
+                ident, level = item["id"], item.get("section_level", 0)
+                group = item.get("lesson_group_id")
+                starts = datetime.fromisoformat(item["date"])
+                ends = (
+                    datetime.fromisoformat(item["date_end"])
+                    if item.get("date_end") is not None
+                    else None
+                )
+                section, room = item.get("section_name", ""), item.get("room_name")
+                if room is None:
+                    room = ""
+                if (
+                    not _positive_id(ident)
+                    or ident in seen
+                    or type(level) is not int
+                    or (group is not None and not _positive_id(group))
+                    or starts.utcoffset() is None
+                    or (
+                        ends is not None and (ends.utcoffset() is None or ends < starts)
+                    )
+                    or not isinstance(section, str)
+                    or not isinstance(room, str)
+                ):
+                    raise ValueError()
+            except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+                raise SportError("Некорректный календарь спортивного API.") from None
+            seen.add(ident)
+            bookings.append(
+                Booking(
+                    ident,
+                    starts,
+                    clean_text(section),
+                    clean_text(room),
+                    level,
+                    group,
+                    ends,
+                )
+            )
+        return sorted(bookings, key=lambda item: (item.starts_at, item.id))
+
+    async def cancel_booking(self, booking: Booking, *, before_delete=None) -> None:
+        if (
+            not isinstance(booking, Booking)
+            or not _positive_id(booking.id)
+            or type(booking.section_level) is not int
+            or booking.section_level not in (1, 2, 3, 4)
+            or (
+                booking.lesson_group_id is not None
+                and not _positive_id(booking.lesson_group_id)
+            )
+            or (booking.section_level != 1 and booking.lesson_group_id is None)
+            or not isinstance(booking.starts_at, datetime)
+            or booking.starts_at.utcoffset() is None
+            or booking.starts_at.timestamp() <= self.now()
+            or before_delete is None
+        ):
+            raise SportError("Отмена этой записи невозможна.")
+        if booking.section_level == 1:
+            result = await self._request(
+                "DELETE",
+                "sign/schedule/lessons",
+                json=[booking.id],
+                before_post=before_delete,
+            )
+            if (
+                not isinstance(result, list)
+                or not all(_positive_id(item) for item in result)
+                or booking.id not in result
+            ):
+                raise SportError("Исход отмены неизвестен. Проверьте запись в My ITMO.")
+        else:
+            await self._request(
+                "DELETE",
+                f"sign/schedule/lesson_groups/{booking.lesson_group_id}",
+                before_post=before_delete,
+            )
 
     async def can_spend_attempt(self, type_id: int) -> bool:
         result = await self._request("GET", "personal/debt" if type_id == 5 else "personal/have_attempts")

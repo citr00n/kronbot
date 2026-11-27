@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and project version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          tag = os.environ['GITHUB_REF_NAME']
+          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag, re.ASCII):
+              raise SystemExit('Release tag must be a canonical stable version vX.Y.Z')
+          with open('pyproject.toml', 'rb') as file:
+              project = tomllib.load(file)['project']
+          if project['name'] != 'kronbot' or tag != 'v' + project['version']:
+              raise SystemExit('Release tag does not match the kronbot project version')
+          PY
+          tagged_commit=$(git rev-parse --verify "refs/tags/${GITHUB_REF_NAME}^{commit}")
+          test "$tagged_commit" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$tagged_commit" refs/remotes/origin/main
+
+  ci:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: [validate, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          python-version: '3.12'
+          enable-cache: false
+      - name: Build distributions
+        run: uv build --sdist --wheel
+      - name: Check distribution metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          uvx --from twine==7.0.0 twine check dist/*
+          python3 - <<'PY'
+          import email
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          version = os.environ['GITHUB_REF_NAME'][1:]
+          directory = Path('dist')
+          wheel = directory / f'kronbot-{version}-py3-none-any.whl'
+          sdist = directory / f'kronbot-{version}.tar.gz'
+          if set(directory.iterdir()) != {wheel, sdist}:
+              raise SystemExit('Unexpected distribution files')
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_metadata = archive.read(f'kronbot-{version}.dist-info/METADATA')
+          with tarfile.open(sdist, 'r:gz') as archive:
+              member = archive.extractfile(f'kronbot-{version}/PKG-INFO')
+              if member is None:
+                  raise SystemExit('Missing sdist metadata')
+              sdist_metadata = member.read()
+          for data in (wheel_metadata, sdist_metadata):
+              metadata = email.message_from_bytes(data)
+              if metadata['Name'] != 'kronbot' or metadata['Version'] != version:
+                  raise SystemExit('Distribution metadata does not match tag')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kronbot/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: python-distributions
+          path: dist
+      - name: Publish to PyPI using Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+
+  github-release:
+    needs: [build, pypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: python-distributions
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

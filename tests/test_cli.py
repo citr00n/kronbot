@@ -57,9 +57,11 @@ async def test_queue_and_single_booking(tmp_path, capsys):
         with pytest.raises(LocalLimit):
             await run("book", "500002")
         assert posts == [b"[500001]"]
+        capsys.readouterr()
         assert await run("queue", "list") == 0
-        assert "500002" in capsys.readouterr().out
-        assert await run("queue", "remove", "500001") == 0
+        output = capsys.readouterr().out
+        assert "500002" in output and "500001" not in output
+        assert await run("queue", "remove", "500002") == 0
         assert len(posts) == 1
         await client.close()
 
@@ -95,8 +97,8 @@ async def test_watch_stop_never_cancels_started_post(tmp_path, stop_at_post):
         client.stopped = True
         release.set()
         assert await task == 0
-        item = store.data["queues"]["owner"][0]
-        assert item["status"] == ("booked" if stop_at_post else "waiting")
+        queue = store.data["queues"]["owner"]
+        assert queue == [] if stop_at_post else queue[0]["status"] == "waiting"
         assert bool(posts) is stop_at_post
         await client.close()
 
@@ -150,7 +152,7 @@ def test_service_install_and_resume(monkeypatch, tmp_path):
     directory = tmp_path / "state with spaces"
     calls = []
     manager = SimpleNamespace(install=lambda exe, path: calls.append(("install", exe, path)),
-                              start=lambda: calls.append(("start",)))
+                              start=lambda: calls.append(("start",)), configured_state_dir=lambda: directory.absolute())
     monkeypatch.setattr(cli, "_service_manager", lambda: manager)
     monkeypatch.setattr(cli, "_service_executable", lambda: "/fake/kronbot")
     monkeypatch.setattr(cli, "state_directory", lambda: directory)
@@ -174,9 +176,61 @@ def test_failed_service_start_keeps_restriction_pause(monkeypatch, tmp_path):
         store.save()
     def fail():
         raise RuntimeError("Не удалось запустить службу.")
-    monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(start=fail))
+    monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(start=fail, configured_state_dir=lambda: directory.absolute()))
     monkeypatch.setattr(cli, "state_directory", lambda: directory)
     with pytest.raises(RuntimeError):
         cli._service_command(parser().parse_args(["service", "start"]))
     with StateStore(directory) as store:
         assert store.data["background_paused"] is True
+
+
+@pytest.mark.parametrize(("status", "target", "expected"), [
+    ("not installed", None, "не установлена"),
+    ("stopped", "current", "остановлена"),
+    ("running", "other", "другого каталога"),
+    ("running", "current", ""),
+])
+def test_service_notice(monkeypatch, tmp_path, status, target, expected):
+    from types import SimpleNamespace
+    from kronbot import cli
+    current = tmp_path / "state"
+    path = current if target == "current" else tmp_path / "other" if target == "other" else None
+    manager = SimpleNamespace(status=lambda: status, configured_state_dir=lambda: path)
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    notice = cli._service_notice(current)
+    assert expected in notice if expected else notice == ""
+
+
+def test_tui_auto_installs_missing_service_once(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from kronbot import cli
+    current = tmp_path / "state"
+    calls = []
+    manager = SimpleNamespace(status=lambda: "not installed", install=lambda exe, path: calls.append((exe, path)))
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    monkeypatch.setattr(cli, "_service_executable", lambda: "/fake/kronbot")
+    assert cli._service_notice(current, install=True) == ""
+    assert calls == [("/fake/kronbot", current)]
+
+
+def test_service_start_never_resumes_another_state(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from kronbot import cli
+    current = tmp_path / "current"
+    calls = []
+    manager = SimpleNamespace(configured_state_dir=lambda: tmp_path / "other", start=lambda: calls.append(True))
+    monkeypatch.setattr(cli, "_service_manager", lambda: manager)
+    monkeypatch.setattr(cli, "state_directory", lambda: current)
+    with pytest.raises(RuntimeError, match="другого каталога"):
+        cli._service_command(parser().parse_args(["service", "start"]))
+    assert not calls
+
+
+def test_cli_warns_when_background_service_is_missing(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+    from kronbot import cli
+    monkeypatch.setenv("KRONBOT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(sys, "argv", ["kronbot", "queue", "list"])
+    monkeypatch.setattr(cli, "_service_manager", lambda: SimpleNamespace(status=lambda: "not installed"))
+    assert cli.main() == 3
+    assert "Фоновая служба не установлена" in capsys.readouterr().err

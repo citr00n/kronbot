@@ -15,12 +15,14 @@ from datetime import datetime
 from pathlib import Path
 
 from .agent import Agent, MSK, QueueError
+from .agent import MSK, Agent, QueueError, auto_delay, opening_wait
 from .auth import AuthError, ItmoAuth, LoginRequired, Restricted
 from .browser import BrowserError
 from .sport import LocalLimit, NetworkBlocked, SportClient, SportError, clean_text
 from .state import StateError, StateLocked, StateStore, state_directory
 
 STATUSES = {"waiting": "Ожидает", "uncertain": "Проверьте в My ITMO", "booked": "Записан", "rejected": "Отказ", "expired": "Истекло"}
+SERVICE_PAUSED_NOTICE = "Фоновая автозапись приостановлена. После окончания блокировки выполните kronbot service start."
 
 
 def positive_id(value):
@@ -41,7 +43,20 @@ def parser():
     login.add_argument("method", nargs="?", choices=("browser", "password", "access-token", "refresh-token"),
                        help="Без аргумента откроется пошаговый выбор")
     sub.add_parser("logout", help="Локально забыть вход")
-    sub.add_parser("schedule", help="Показать расписание на семь дней")
+    sub.add_parser("schedule", help="Расписание сегодня и на 14 дней вперёд")
+    sub.add_parser("bookings", help="Показать активные записи My ITMO")
+    cancel = sub.add_parser("cancel", help="Отписаться от занятия в My ITMO")
+    cancel.add_argument("id", type=positive_id, metavar="ID")
+    cancel.add_argument(
+        "--yes",
+        action="store_true",
+        help="Подтвердить отмену без интерактивного вопроса",
+    )
+    cancel.add_argument(
+        "--whole-group",
+        action="store_true",
+        help="Разрешить отмену всей семестровой группы",
+    )
     queue = sub.add_parser("queue", help="Управлять локальной очередью")
     actions = queue.add_subparsers(dest="queue_command", required=True)
     actions.add_parser("list", help="Показать очередь")
@@ -159,9 +174,67 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
         except StateError:
             store.data["session"] = old
             raise
-        print("Вход выполнен.")
+        if session.isu is None and not cancel.is_set():
+            try:
+                await sport.account_isu()
+            except (AuthError, SportError, StateError):
+                print("Не удалось получить номер ИСУ; вход сохранён.", file=sys.stderr)
+        print(f"Вход выполнен. ИСУ: {store.data['session'].get('isu') or 'не указан'}")
         return 0
     _live_session(store, now())
+    if command == "bookings":
+        bookings = await agent.bookings()
+        if not bookings:
+            print("Нет активных и предстоящих записей на ближайшие 365 дней.")
+        for booking in bookings:
+            when = booking.starts_at.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+            kind = (
+                "разовое занятие"
+                if booking.section_level == 1
+                else "семестровая группа"
+                if booking.section_level in (2, 3, 4)
+                else "тип занятия неизвестен"
+            )
+            if booking.starts_at.timestamp() <= now():
+                kind += ", занятие уже идёт"
+            print(
+                f"{booking.id}  {when}  {booking.section_name}  {booking.room_name}  {kind}"
+            )
+        return 0
+    if command == "cancel":
+        bookings = await agent.bookings()
+        booking = next((item for item in bookings if item.id == args.id), None)
+        if booking is None:
+            raise QueueError("Активная запись не найдена.")
+        if booking.starts_at.timestamp() <= now():
+            raise QueueError(
+                "Занятие уже началось. Проверьте возможность отписки в My ITMO."
+            )
+        group = booking.section_level in (2, 3, 4)
+        if group and not args.whole_group:
+            raise QueueError(
+                "Это запись на семестровую группу. Для отмены всей группы укажите --whole-group."
+            )
+        if not args.yes:
+            if not sys.stdin.isatty() or not sys.stderr.isatty():
+                raise ValueError("Для подтверждения нужен терминал или флаг --yes.")
+            warning = (
+                "Отписаться от всей семестровой группы"
+                if group
+                else "Отписаться от занятия"
+            )
+            try:
+                answer = (
+                    input(f"{warning} {booking.id} в My ITMO? [y/N]: ").strip().lower()
+                )
+            except (EOFError, OSError):
+                raise ValueError("Подтверждение не получено.") from None
+            if answer not in ("y", "yes", "д", "да"):
+                print("Отмена записи не выполнена.")
+                return 0
+        await agent.cancel_booking(booking)
+        print("Запись отменена в My ITMO.")
+        return 0
     if command == "queue" and args.queue_command == "list":
         queue = agent.queue()
         if not queue:
@@ -180,7 +253,7 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
         await agent.check(allow_booking=False)
         if command == "schedule":
             if not agent.snapshot:
-                print("Нет занятий на ближайшие 7 дней")
+                print("Нет занятий сегодня и на 14 дней вперёд")
             for lesson in agent.snapshot:
                 date_text = lesson.starts_at.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
                 warning = "  Пересечение с расписанием" if lesson.intersection else ""
@@ -207,17 +280,22 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
             return 4
         item = next((x for x in agent.queue() if x["lesson_id"] == args.id), None)
         fresh_signed = any(x.id == args.id and x.signed for x in agent.snapshot)
-        if fresh_signed:
-            print("Уже записан")
+        if args.id in agent.confirmed_ids or fresh_signed:
+            print("Уже записан" if fresh_signed else "Записан")
             return 0
         if item is not None:
             print(_item_line(item))
-            if item["status"] == "booked" and previous != "booked":
-                return 0
         return 4
     if command == "watch":
         print("Автозапись запущена. Остановка: Ctrl+C.")
         previous = {x["lesson_id"]: x["status"] for x in agent.queue()}
+        if any(status in ("waiting", "uncertain") for status in previous.values()):
+            wait_until_open = opening_wait(now())
+            if wait_until_open:
+                try:
+                    await asyncio.wait_for(cancel.wait(), timeout=wait_until_open)
+                except TimeoutError:
+                    pass
         while not cancel.is_set():
             queue = agent.queue()
             if not any(x["status"] in ("waiting", "uncertain") for x in queue):
@@ -236,6 +314,9 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
                 if cancel.is_set():
                     return 0
                 print(str(exc), file=sys.stderr)
+            for ident in sorted(agent.confirmed_ids):
+                print(f"{ident}  Записан")
+                previous.pop(ident, None)
             for item in queue:
                 if previous.get(item["lesson_id"]) != item["status"]:
                     print(_item_line(item))
@@ -247,6 +328,7 @@ async def execute(args, store, sport, *, cancel=None, now=time.time, monotonic=t
                     print("Проверьте запись в My ITMO; повторная попытка требует подтверждения.", file=sys.stderr)
                     return 4
                 return 0
+            delay = auto_delay(now(), delay)
             try:
                 await asyncio.wait_for(cancel.wait(), timeout=delay)
             except TimeoutError:
@@ -304,6 +386,32 @@ def _service_executable() -> str:
     return os.fspath(executable)
 
 
+def _same_directory(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve())) == os.path.normcase(
+        str(right.resolve())
+    )
+
+
+def _service_notice(directory: Path, *, install: bool = False) -> str:
+    """Проверить службу текущего каталога; TUI может установить отсутствующую."""
+    try:
+        manager = _service_manager()
+        status = manager.status()
+        if status == "not installed":
+            if install:
+                manager.install(_service_executable(), directory)
+                return ""
+            return "Фоновая служба не установлена. Выполните kronbot service install."
+        target = manager.configured_state_dir()
+        if target is None or not _same_directory(target, directory):
+            return "Фоновая служба настроена для другого каталога состояния. Проверьте KRONBOT_STATE_DIR."
+        if status != "running":
+            return "Фоновая служба остановлена. Выполните kronbot service start."
+        return ""
+    except (RuntimeError, OSError, ValueError):
+        return "Не удалось проверить или установить фоновую службу. Проверьте kronbot service status."
+
+
 def _service_command(args) -> int:
     action = args.service_command
     if action == "run":
@@ -318,6 +426,12 @@ def _service_command(args) -> int:
         print({"running": "Служба запущена", "stopped": "Служба остановлена",
                "not installed": "Служба не установлена"}[status])
         if status != "not installed":
+            target = manager.configured_state_dir()
+            if target is None or not _same_directory(target, directory):
+                print(
+                    "Фоновая служба настроена для другого каталога состояния. Проверьте KRONBOT_STATE_DIR."
+                )
+                return 0
             try:
                 with StateStore(directory) as store:
                     if store.data["background_paused"]:
@@ -328,6 +442,12 @@ def _service_command(args) -> int:
                 print("Состояние очереди сейчас занято.")
         return 0
     if action in ("install", "start"):
+        if action == "start":
+            target = manager.configured_state_dir()
+            if target is not None and not _same_directory(target, directory):
+                raise RuntimeError(
+                    "Фоновая служба настроена для другого каталога состояния. Проверьте KRONBOT_STATE_DIR."
+                )
         with StateStore(directory) as store:
             until = max(store.data["blocked_until"].values(), default=0)
             if until > time.time():
@@ -380,8 +500,13 @@ def main() -> int:
         except (ValueError, StateError, RuntimeError, LocalLimit) as exc:
             print(str(exc), file=sys.stderr)
             return 3 if isinstance(exc, LocalLimit) else 1
+    notice = _service_notice(state_directory().expanduser().absolute())
+    if notice:
+        print(f"Предупреждение: {notice}", file=sys.stderr)
     try:
         with StateStore() as store:
+            if store.data["background_paused"]:
+                print(f"Предупреждение: {SERVICE_PAUSED_NOTICE}", file=sys.stderr)
             return asyncio.run(_run(args, store))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)

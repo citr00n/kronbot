@@ -45,7 +45,27 @@ def _validate_state(data):
         raise ValueError()
     session = data["session"]
     if session is not None:
-        if not isinstance(session, dict) or set(session) != {"sub", "access_token", "access_expires_at", "refresh_token", "refresh_expires_at"}:
+        if not isinstance(session, dict) or set(session) not in ({
+            "sub",
+            "access_token",
+            "access_expires_at",
+            "refresh_token",
+            "refresh_expires_at",
+        }, {
+            "sub",
+            "access_token",
+            "access_expires_at",
+            "refresh_token",
+            "refresh_expires_at",
+            "isu",
+        }):
+            raise ValueError()
+        session.setdefault("isu", None)
+        isu = session["isu"]
+        if isu is not None and not (
+            isinstance(isu, str) and isu.isascii() and isu.isdecimal()
+            and any(c != "0" for c in isu)
+        ):
             raise ValueError()
         if not all(isinstance(session[k], str) and session[k] for k in ("sub", "access_token")):
             raise ValueError()

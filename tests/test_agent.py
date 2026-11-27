@@ -44,7 +44,10 @@ async def test_booking_and_uncertain_reconciliation(tmp_path):
         assert agent.queue()[0]["status"] == "uncertain" and len(posts) == 1
         mode["calendar"] = [{"id": 500001, "signed": False}]
         await agent.check(allow_booking=False)
-        assert agent.queue()[0]["status"] == "booked" and len(posts) == 1
+        assert agent.queue() == [] and agent.confirmed_ids == {500001} and len(posts) == 1
+        await agent.check(allow_booking=False)
+        assert agent.confirmed_ids == set()
+        assert agent.queue() == []
         await sport.close()
 
 
@@ -179,3 +182,85 @@ async def test_401_refreshes_once_and_persists_rotation(tmp_path):
         await client.close()
     with StateStore(directory) as store:
         assert store.data["session"]["refresh_token"] == "new-refresh"
+
+
+@pytest.mark.parametrize("confirmation", ["schedule", "calendar", "post"])
+async def test_confirmed_entries_removed_and_range_includes_opening_day(tmp_path, confirmation):
+    now = int(datetime(2030, 1, 15, 23, 59, tzinfo=timezone(timedelta(hours=3))).timestamp())
+    start = datetime.fromtimestamp(now + 14 * 86400, timezone.utc).isoformat()
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"error_code": 0, "result": [1]})
+        if request.url.path.endswith("/sign/schedule"):
+            row = {"id": 1, "date": start, "section_level": 1, "type_id": 2,
+                   "available": 1, "signed": confirmation == "schedule",
+                   "can_sign_in": {"can_sign_in": True}}
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [row]}]})
+        if request.url.path.endswith("/personal/calendar"):
+            lessons = [{"id": 1}] if confirmation == "calendar" else []
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": lessons}]})
+        return httpx.Response(200, json={"error_code": 0,
+                                         "result": {"free_attempts": 1, "can_sign_in": True}})
+
+    directory = tmp_path / "state"
+    with StateStore(directory) as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access",
+                                 "access_expires_at": now + 10000,
+                                 "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Секция",
+                                          "starts_at": start, "status": "waiting",
+                                          "refusal_code": None}]
+        store.save()
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        await agent.check(allow_booking=True)
+        assert agent.queue() == []
+        assert agent.confirmed_ids == {1}
+        schedule = next(request for request in calls if request.url.path.endswith("/sign/schedule"))
+        assert schedule.url.params["date_start"] == "2030-01-15"
+        assert schedule.url.params["date_end"] == "2030-01-29"
+        assert sum(request.method == "POST" for request in calls) == (confirmation == "post")
+        await sport.close()
+    with StateStore(directory) as store:
+        assert store.data["queues"]["owner"] == []
+
+
+async def test_confirmation_save_failure_restores_uncertain_entry(tmp_path, monkeypatch):
+    from kronbot.state import StateError
+
+    now = 1900000000
+    start = datetime.fromtimestamp(now + 86400, timezone.utc).isoformat()
+
+    def handler(request):
+        if request.url.path.endswith("/sign/schedule"):
+            row = {"id": 1, "date": start, "section_level": 1, "type_id": 2,
+                   "available": 1, "signed": True, "can_sign_in": {"can_sign_in": True}}
+            return httpx.Response(200, json={"error_code": 0, "result": [{"lessons": [row]}]})
+        raise AssertionError("unexpected request")
+
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access",
+                                 "access_expires_at": now + 10000,
+                                 "refresh_token": None, "refresh_expires_at": None}
+        store.data["queues"]["owner"] = [{"lesson_id": 1, "section_name": "Секция",
+                                          "starts_at": start, "status": "uncertain",
+                                          "refusal_code": None}]
+        store.save()
+        sport = SportClient(store, transport=httpx.MockTransport(handler), now=lambda: now)
+        agent = Agent(store, sport, now=lambda: now)
+        real_save = store.save
+
+        def fail_removal():
+            if not store.data["queues"]["owner"]:
+                raise StateError("synthetic")
+            real_save()
+
+        monkeypatch.setattr(store, "save", fail_removal)
+        with pytest.raises(StateError):
+            await agent.check(allow_booking=False)
+        assert agent.queue()[0]["status"] == "uncertain"
+        assert agent.confirmed_ids == set()
+        await sport.close()
