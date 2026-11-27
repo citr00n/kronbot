@@ -133,9 +133,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" --jq .body > "$RUNNER_TEMP/kronbot-release-notes.md"
           prerelease=''
           if [[ "$GITHUB_REF_NAME" =~ (a|\.dev)[0-9]+$ ]]; then
             prerelease=--prerelease
           fi
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes ${prerelease:+"$prerelease"}
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/kronbot-release-notes.md" ${prerelease:+"$prerelease"}

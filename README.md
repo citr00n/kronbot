@@ -169,6 +169,8 @@ uv run --locked pytest -q tests/test_browser.py
 
 CI запускается для PRов, но не после слияния в `main`. Релизный workflow отдельно вызывает CI, проверяет тег и версию в `pyproject.toml`, собирает пакет и публикует его в PyPI через Trusted Publishing, после чего создаёт GitHub Release. Стабильный тег — `vX.Y.Z`, alpha — `vX.Y.ZaN`, dev — `vX.Y.Z.devN`; alpha и dev отмечаются на GitHub как prerelease.
 
+Для каждого GitHub Release автоматически формируется описание изменений со ссылками на включённые pull request. Уведомление о новой версии содержит ссылку на соответствующий релиз.
+
 ## Лицензия
 
 [MIT](LICENSE), Copyright (c) 2026 citr0n.

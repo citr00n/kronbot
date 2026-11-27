@@ -56,7 +56,10 @@ def check_update() -> str | None:
                 commands = "uv tool upgrade --prerelease allow kronbot или pipx upgrade --pip-args=--pre kronbot"
             else:
                 commands = "uv tool upgrade kronbot или pipx upgrade kronbot"
-            return f"Доступна новая версия kronbot {latest}. Обновите: {commands}."
+            return (
+                f"Доступна новая версия kronbot {latest}. Обновите: {commands}. "
+                f"Изменения: https://github.com/citr00n/kronbot/releases/tag/v{latest}"
+            )
     except Exception:
         return None
     return None

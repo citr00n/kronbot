@@ -30,6 +30,7 @@ def test_versions(monkeypatch, current, versions, expected, prerelease):
     else:
         assert expected in result
         assert "uv tool upgrade" in result and "pipx upgrade" in result
+        assert f"https://github.com/citr00n/kronbot/releases/tag/v{expected}" in result
         assert ("--prerelease allow" in result and "--pip-args=--pre" in result) == prerelease
 
 
