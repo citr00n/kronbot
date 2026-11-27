@@ -103,8 +103,8 @@ async def test_login_password_is_masked_and_escape_returns(tmp_path):
     [
         ("browser", ("kronbot browser install", "графическая сессия", "sandbox", "отдельном"), False, False),
         ("password", ("логин", "Пароль скрыт", "веб-вход"), True, True),
-        ("refresh", ("только свой", "скрытое", "ротирован", "сессия"), False, True),
-        ("access", ("только свой", "скрытое", "не продлевается"), False, True),
+        ("refresh", ("auth.refresh_token.itmoId", "скрытое", "ротирует", "сесси"), False, True),
+        ("access", ("auth._token.itmoId", "скрытое", "не продлевается"), False, True),
     ],
 )
 async def test_login_guide_methods_fit_terminal(method, phrases, username_visible, secret_visible):
@@ -438,6 +438,110 @@ async def test_first_auto_cycle_waits_for_midnight_but_manual_refresh_does_not(t
             await pilot.pause()
             assert app.agent.check.await_count == 3
             assert app.agent.check.await_args.kwargs == {"allow_booking": True}
+        await app.sport.close()
+
+
+async def test_automatic_forecast_rows_and_selection(tmp_path):
+    from dataclasses import replace
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+    from textual.widgets import Select
+    from kronbot.agent import MSK
+    from kronbot.sport import Lesson, forecast_prototypes
+
+    now = 1900000000
+    start = datetime.fromtimestamp(now + 86400, timezone.utc)
+    prototype = Lesson(
+        42, "Плавание", "Бассейн", start, 1, 2, 3, False, False, True,
+        section_id=10, lesson_level=1, building_id=2, room_id=3,
+        time_slot_id=4, teacher_isu=5, ends_at=start + timedelta(hours=1),
+    )
+    duplicate = replace(prototype, id=43)
+    incomplete = replace(prototype, id=44, teacher_isu=None)
+    target = replace(prototype, id=45, starts_at=start + timedelta(days=14),
+                     ends_at=prototype.ends_at + timedelta(days=14))
+    assert forecast_prototypes([duplicate, prototype, incomplete], now) == [prototype]
+    assert forecast_prototypes([prototype, target], now) == [target]
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.agent.snapshot = [prototype, incomplete]
+            app.stale = False
+            app._render()
+            table = app.query_one("#schedule", DataTable)
+            assert table.row_count == 3
+            assert [table.coordinate_to_cell_key((row, 0)).row_key.value for row in range(3)] == ["42", "44", "forecast:42"]
+            row = table.get_row("forecast:42")
+            assert "прототип" in str(row[0]) and "Прогноз" in str(row[2])
+            assert str(row[1]) == (start + timedelta(days=14)).astimezone(MSK).strftime("%d.%m %H:%M")
+            assert str(row[4]) == str(row[5]) == "Неизвестно"
+            table.focus()
+            table.move_cursor(row=2)
+            await pilot.press("enter")
+            assert app.agent.queue()[0]["forecast"]["prototype_lesson_id"] == 42
+            assert not app.agent.queue()[0]["forecast"]["bound"]
+            assert "Ожидает" in str(table.get_row("forecast:42")[6])
+            app.query_one("#filter-sign", Select).value = "yes"
+            await pilot.pause()
+            assert table.row_count == 2
+            app.query_one("#filter-sign", Select).value = "all"
+            app.query_one("#filter-places", Select).value = "no"
+            await pilot.pause()
+            assert table.row_count == 1  # сообщение о пустом результате
+            app.query_one("#filter-places", Select).value = "all"
+            await pilot.pause()
+            assert app._selected(table) == "forecast:42"
+            app._render()
+            await pilot.pause()
+            assert app._selected(table) == "forecast:42"
+            app.stale = True
+            await pilot.press("enter")
+            assert "устарело" in app.error and len(app.agent.queue()) == 1
+        await app.sport.close()
+
+
+async def test_forecast_scroll_refresh_and_disappearing_selection(tmp_path):
+    from dataclasses import replace
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+    from kronbot.sport import Lesson
+
+    now = 1900000000
+    start = datetime.fromtimestamp(now + 86400, timezone.utc)
+    prototype = Lesson(
+        100, "Секция", "Зал", start, 1, 2, 1, False, False, True,
+        section_id=1, lesson_level=1, building_id=2, room_id=3,
+        time_slot_id=4, teacher_isu=5, ends_at=start + timedelta(hours=1),
+    )
+    lessons = [replace(prototype, id=100 + i, section_id=100 + i) for i in range(20)]
+    with StateStore(tmp_path / "state") as store:
+        store.data["session"] = {"sub": "owner", "access_token": "access", "access_expires_at": now + 10000, "refresh_token": None, "refresh_expires_at": None}
+        app = KronbotApp(store, now=lambda: now)
+        app.agent.check = AsyncMock()
+        app.agent.bookings = AsyncMock(return_value=[])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.agent.snapshot = lessons
+            app.stale = False
+            app._render()
+            table = app.query_one("#schedule", DataTable)
+            table.focus()
+            table.move_cursor(row=table.get_row_index("forecast:119"))
+            await pilot.pause()
+            scroll = table.scroll_y
+            assert scroll > 0
+            app._render()
+            await pilot.pause()
+            assert app._selected(table) == "forecast:119"
+            assert table.scroll_y == scroll
+            app.agent.snapshot = lessons[:-1]
+            await pilot.press("enter")
+            assert not app.agent.queue()
+            assert "не найдено" in app.error
         await app.sport.close()
 
 

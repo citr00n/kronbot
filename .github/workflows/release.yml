@@ -123,6 +123,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: python-distributions
@@ -135,6 +140,7 @@ jobs:
           set -euo pipefail
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f tag_name="$GITHUB_REF_NAME" --jq .body > "$RUNNER_TEMP/kronbot-release-notes.md"
+          python3 .github/scripts/release_notes.py "$RUNNER_TEMP/kronbot-release-notes.md"
           prerelease=''
           if [[ "$GITHUB_REF_NAME" =~ (a|\.dev)[0-9]+$ ]]; then
             prerelease=--prerelease
